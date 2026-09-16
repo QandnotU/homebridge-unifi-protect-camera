@@ -40,7 +40,18 @@ All notable changes to this project are documented here. The format follows
 - A smart detection whose object class Protect had not yet resolved was logged as though
   the classification were known.
 
+- Phase 2 — live video, passthrough first. HomeKit live streaming with the camera's own
+  H.264 repacketized into SRTP: no decoding, no scaling, no re-encoding, and no FFmpeg
+  process in the happy path. Confirmed against a UVC G5 Bullet at 235 ms to first frame.
+- Per-session diagnostics recording what HomeKit requested, which Protect channel was
+  chosen, whether anything was transcoded, and the timings — including HomeKit's
+  mid-session adaptive reconfigurations, which are appended rather than overwritten.
+- Honest resolution advertisement: only channels the camera can actually deliver are
+  offered, and each refusal is logged with its reason.
+
 ### Not yet implemented
 
-- Video, snapshots and HomeKit Secure Video.
+- Snapshot coalescing and caching; snapshots currently go straight to the controller.
+- HomeKit Secure Video recording — selecting "View and Record" in the Home app will fail.
+- Transcoding, for streams no native channel can satisfy.
 - Doorbells, two-way audio, floodlights and chimes.

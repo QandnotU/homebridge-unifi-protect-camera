@@ -1022,6 +1022,22 @@ spawned** in the happy path; every session logs a complete diagnostic showing
 `Mode: Direct H.264 Passthrough`; measured time-to-first-frame recorded as the baseline
 all later changes are compared against.
 
+> **Met 2026-09-16.** Live video confirmed in the Home app against a G5 Bullet, with no
+> perceptible delay on opening the tile.
+>
+> | Baseline | |
+> |---|---|
+> | Delivery | `Direct H.264 Passthrough`, no transcode |
+> | FFmpeg processes | 0 |
+> | Time to first RTP | **235 ms** (476 ms on a cold Protect session) |
+> | Time to first keyframe | 235 ms |
+> | Session | 258 frames, 3 keyframes, 469 packets, 358.7 KB, 0 send errors |
+> | Negotiated | 1280×720@30 / 299 Kbps → Medium channel, exact match |
+> | Adaptation | stepped to 640×360 / 132 Kbps at ~4.5 s |
+>
+> Compare every later change against 235 ms. A regression here is the first signal that
+> something has been added to the hot path.
+
 `src/homekit/renderers/renderer.ts` is deliberately introduced in Phase 2 even though
 there is only one implementation. It is the seam that makes a future
 `secure-video-renderer.ts` additive.
