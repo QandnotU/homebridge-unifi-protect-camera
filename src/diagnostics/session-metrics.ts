@@ -1,7 +1,7 @@
 import type { DeliveryMode, StreamSelection } from '../media/select/stream-selector.js'
 import type { SenderStats } from '../media/rtp/sender.js'
 import { describeMode, formatBitrate, isTranscoding } from '../media/select/stream-selector.js'
-import { formatLevel, formatProfile } from '../media/fmp4/avcc.js'
+import { formatHapLevel, formatHapProfile } from '../homekit/hap-constants.js'
 
 /** What HomeKit asked for, as reported in `StartStreamRequest.video`. */
 export interface RequestedVideo {
@@ -9,6 +9,7 @@ export interface RequestedVideo {
   readonly height: number
   readonly fps: number
   readonly maxBitrate: number
+  /** HAP enum indices, not H.264 wire values. */
   readonly profile: number
   readonly level: number
   readonly ssrc: number
@@ -122,8 +123,8 @@ export class SessionMetrics {
     lines.push(`  Resolution : ${request.width.toString()}x${request.height.toString()}`)
     lines.push(`  FPS        : ${request.fps.toString()}`)
     lines.push(`  Bitrate    : ${formatBitrate(request.maxBitrate)}`)
-    lines.push(`  Profile    : ${formatProfile(request.profile)}`)
-    lines.push(`  Level      : ${formatLevel(request.level)}`)
+    lines.push(`  Profile    : ${formatHapProfile(request.profile)}`)
+    lines.push(`  Level      : ${formatHapLevel(request.level)}`)
     lines.push(`  MTU        : ${request.mtu.toString()}`)
     lines.push(`  Destination: ${request.local ? 'Local' : 'Remote'}`)
 

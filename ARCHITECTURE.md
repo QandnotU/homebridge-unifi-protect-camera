@@ -412,6 +412,23 @@ this project:
 Treat all of that as high-quality but unreplicated third-party reporting until we
 reproduce it ourselves.
 
+### Q5b. A strict plugin cannot import HAP's enums at all
+
+Discovered while wiring the streaming delegate. `StreamRequestTypes`, `H264Profile`,
+`H264Level` and `SRTPCryptoSuites` are declared as **ambient const enums** in
+HAP-NodeJS's `.d.ts`. Homebridge re-exports them at runtime, but TypeScript refuses to
+read an ambient const enum under `verbatimModuleSyntax` — TS2748 — so any plugin using
+that setting cannot reference them as values.
+
+The wire values are restated in `src/homekit/hap-constants.ts` with the reason recorded,
+and the `StreamingRequest` union is narrowed by hand. Note also that `'video' in request`
+does **not** discriminate that union: both the start and reconfigure variants carry
+`video`, with different shapes.
+
+One consequence worth knowing: HomeKit reports the profile and level it selected as
+*indices into those enums*, not as H.264 wire values. Formatting them with an H.264
+formatter produces nonsense such as `profile 2` and level `0.2`.
+
 ### Q6. What H.264 profiles/levels are permitted?
 
 Advertise any subset of:
@@ -1038,11 +1055,39 @@ renderer interface — which is a strong argument for having that interface from
 Untestable until §8.3 resolves. Apple's text permits approximate resolutions; the
 practical answer needs a real hub.
 
-### 8.5 Protect fMP4 → RTP fidelity
+### 8.5 Protect fMP4 → RTP fidelity — largely answered 2026-09-16
 
-Protect delivers fMP4. Verify that the `avcC` in the init segment yields SPS/PPS that
-iOS accepts, that B-frames (if any) don't break RTP timestamp ordering, and what the
-native GOP length actually is.
+Verified against a live G5 Bullet. Live video reaches the Home app as
+`Direct H.264 Passthrough`, first RTP packet at 235 ms, no FFmpeg process.
+
+Measured facts:
+
+- **Media timescale is 90000** — identical to RTP's video clock, so the timestamp
+  conversion is one-to-one.
+- The init segment carries **1 SPS and 1 PPS** in `avcC`, and in-band parameter sets are
+  absent, so `withParameterSets()` is load-bearing rather than defensive.
+- **Apple adapts downward within seconds.** A session negotiated at 1280×720 / 299 Kbps
+  was reconfigured to 640×360 / 132 Kbps about 4.5–5 s in, every time. This is the
+  behaviour observed in Scrypted, now visible in our own diagnostics.
+- Codec string is `avc1.4d401f,mp4a.40.2`: **Main profile, level 3.1**, plus AAC.
+
+Two traps, both of which cost a debugging cycle and neither of which is visible in the
+library's types:
+
+1. **`Segment.mdat` is the mdat box *header*, not the payload.** The library assembles a
+   segment as `[moof][mdat header][video][audio]` and slices `mdat` from the header
+   frames alone. The samples are in `Segment.data`. Feeding `mdat` to a NAL walker yields
+   exactly zero frames.
+2. **Video and audio share one `mdat`.** An earlier design note here claimed the sample
+   table could be skipped entirely, because AVCC samples are self-delimiting. That is
+   true only if the `mdat` holds nothing else. It holds AAC too, and walking the whole
+   payload read ~10% of it as a spurious extra picture — which made the access-unit count
+   disagree with the controller's timestamps and silently dropped the stream onto
+   synthesised timing. `trun` parsing is required; `media/fmp4/moof.ts` does it, keyed on
+   the video track id from the init segment's `tkhd`.
+
+Still open: whether B-frames appear (none observed so far), the native GOP length, and
+whether SRTCP sender reports are needed for long sessions.
 
 ---
 

@@ -38,3 +38,26 @@ export const SRTP_CRYPTO_SUITE = {
   AES_CM_256_HMAC_SHA1_80: 1,
   NONE: 2,
 } as const
+
+/**
+ * HomeKit reports the profile and level it selected as indices into the HAP enums above,
+ * not as H.264 wire values. Formatting them with the H.264 formatters yields nonsense
+ * like "profile 2" and "0.2", so the diagnostics use these instead.
+ */
+export function formatHapProfile(index: number): string {
+  switch (index) {
+    case H264_PROFILE.BASELINE: return 'Baseline'
+    case H264_PROFILE.MAIN: return 'Main'
+    case H264_PROFILE.HIGH: return 'High'
+    default: return `profile index ${index.toString()}`
+  }
+}
+
+export function formatHapLevel(index: number): string {
+  switch (index) {
+    case H264_LEVEL.LEVEL3_1: return '3.1'
+    case H264_LEVEL.LEVEL3_2: return '3.2'
+    case H264_LEVEL.LEVEL4_0: return '4.0'
+    default: return `level index ${index.toString()}`
+  }
+}

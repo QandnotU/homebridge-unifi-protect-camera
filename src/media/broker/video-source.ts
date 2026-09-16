@@ -6,7 +6,59 @@ import type { ScopedLogger } from '../../core/logger.js'
 import type { TrackInfo } from '../fmp4/init-segment.js'
 import { applyTimestamps, splitAccessUnits, withParameterSets } from '../fmp4/demux.js'
 import { readAvcConfig } from '../fmp4/avcc.js'
+import { iterateBoxes } from '../fmp4/boxes.js'
+import { parseMoof, readVideoTrackId } from '../fmp4/moof.js'
 import { readTrackInfo } from '../fmp4/init-segment.js'
+
+/**
+ * The video samples of a media segment, and nothing else.
+ *
+ * Two traps here, both found by probing a live controller rather than by reading types:
+ *
+ * `segment.mdat` is only the mdat *box header* — the library assembles the segment as
+ * `[moof][mdat header][video][audio]` and slices `mdat` from the header frames alone, so
+ * the samples live in `segment.data`.
+ *
+ * And that `mdat` carries AAC as well as H.264. Walking the whole payload by NAL length
+ * prefixes reads audio as though it were video: it yields a spurious extra picture, which
+ * makes the access-unit count disagree with the controller's timestamps and silently
+ * drops the stream onto synthesised timing. So the video byte range comes from the
+ * `trun`, which is the only thing that actually knows where video ends.
+ */
+export function videoPayload(segment: { data?: Buffer, moof?: Buffer }, videoTrackId: number | null): Buffer | null {
+  const data = segment.data
+
+  if (!data) {
+    return null
+  }
+
+  if (videoTrackId !== null) {
+    const runs = parseMoof(data)
+    const video = runs.find(run => run.trackId === videoTrackId)
+
+    if (video && (video.totalBytes > 0)) {
+      // `data_offset` is relative to the start of the moof box, which is the start of the
+      // segment here.
+      const start = video.dataOffset
+      const end = start + video.totalBytes
+
+      if ((start >= 0) && (end <= data.length)) {
+        return data.subarray(start, end)
+      }
+    }
+  }
+
+  // No usable sample table: fall back to the whole mdat body. The NAL walk will stop when
+  // it reaches audio, so this still yields the pictures — just with the timestamp
+  // mismatch described above. A degraded stream beats no stream.
+  for (const box of iterateBoxes(data)) {
+    if (box.type === 'mdat') {
+      return box.body
+    }
+  }
+
+  return null
+}
 
 export interface VideoSourceOptions {
   readonly camera: Camera
@@ -30,22 +82,25 @@ export interface VideoSourceOptions {
 export class VideoSource {
   readonly #config: AvcConfig
   readonly #track: TrackInfo
-  readonly #subscription: AsyncIterable<{ type: string, mdat?: Buffer, timestamps?: number[] }>
+  readonly #subscription: AsyncIterable<{ type: string, data?: Buffer, mdat?: Buffer, moof?: Buffer, timestamps?: number[] }>
   readonly #log: ScopedLogger
   readonly #fps: number
+  readonly #videoTrackId: number | null
 
   private constructor(
     config: AvcConfig,
     track: TrackInfo,
-    subscription: AsyncIterable<{ type: string, mdat?: Buffer, timestamps?: number[] }>,
+    subscription: AsyncIterable<{ type: string, data?: Buffer, mdat?: Buffer, moof?: Buffer, timestamps?: number[] }>,
     log: ScopedLogger,
     fps: number,
+    videoTrackId: number | null,
   ) {
     this.#config = config
     this.#track = track
     this.#subscription = subscription
     this.#log = log
     this.#fps = fps
+    this.#videoTrackId = videoTrackId
   }
 
   /**
@@ -59,7 +114,9 @@ export class VideoSource {
     const subscription = options.camera.livestream({
       signal: options.signal,
       source: { channel: options.channelId, type: 'channel' },
-      // Opting in to decode timestamps is what lets the demuxer skip moof/trun entirely.
+      // Per-picture decode timestamps from the controller. Measured against a live
+      // stream these match the access-unit count exactly, so the stream runs on the
+      // camera's own clock rather than a synthesised one.
       timestamps: true,
     })
 
@@ -93,7 +150,13 @@ export class VideoSource {
       options.channelId.toString(), track.width.toString(), track.height.toString(),
       track.timescale.toString(), config.sps.length.toString(), config.pps.length.toString())
 
-    return new VideoSource(config, track, subscription, options.log, options.fps)
+    const videoTrackId = readVideoTrackId(init.data)
+
+    if (videoTrackId === null) {
+      options.log.warn('Could not identify the video track; audio may be misread as video.')
+    }
+
+    return new VideoSource(config, track, subscription, options.log, options.fps, videoTrackId)
   }
 
   get config(): AvcConfig {
@@ -121,7 +184,13 @@ export class VideoSource {
         continue
       }
 
-      const units = splitAccessUnits(segment.mdat, this.#config)
+      const payload = videoPayload(segment, this.#videoTrackId)
+
+      if (!payload) {
+        continue
+      }
+
+      const units = splitAccessUnits(payload, this.#config)
 
       if (units.length === 0) {
         continue
