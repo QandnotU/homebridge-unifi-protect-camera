@@ -43,7 +43,7 @@ describe('parseMoof', () => {
     const runs = parseMoof(moof)
 
     expect(runs).toHaveLength(1)
-    expect(runs[0]).toEqual({ dataOffset: 248, sampleCount: 3, totalBytes: 600, trackId: 1 })
+    expect(runs[0]).toEqual({ compositionOffsets: [], dataOffset: 248, sampleCount: 3, totalBytes: 600, trackId: 1 })
   })
 
   it('separates video from audio, which is the whole point', () => {
@@ -81,7 +81,7 @@ describe('parseMoof', () => {
       box('trun', Buffer.concat([Buffer.from([0, 0x00, 0x00, 0x01]), u32(2, 100)])),
     ])))
 
-    expect(parseMoof(moof)[0]).toEqual({ dataOffset: 100, sampleCount: 2, totalBytes: 154, trackId: 7 })
+    expect(parseMoof(moof)[0]).toEqual({ compositionOffsets: [], dataOffset: 100, sampleCount: 2, totalBytes: 154, trackId: 7 })
   })
 
   it('returns nothing for a moof with no track fragments', () => {
@@ -122,5 +122,56 @@ describe('readVideoTrackId', () => {
   it('returns null when there is no video track', () => {
     expect(readVideoTrackId(box('moov', trak(2, 'mp4a')))).toBeNull()
     expect(readVideoTrackId(box('ftyp', Buffer.from('isom')))).toBeNull()
+  })
+})
+
+describe('composition time offsets', () => {
+  /** trun with data-offset, sample-size and composition-offset present (flags 0xa01). */
+  function trunWithComposition(version: number, sizes: number[], offsets: number[]): Buffer {
+    const perSample = Buffer.concat(sizes.map((size, index) => {
+      const entry = Buffer.alloc(8)
+
+      entry.writeUInt32BE(size, 0)
+
+      if (version === 0) {
+        entry.writeUInt32BE(offsets[index] ?? 0, 4)
+      } else {
+        entry.writeInt32BE(offsets[index] ?? 0, 4)
+      }
+
+      return entry
+    }))
+
+    return box('trun', Buffer.concat([
+      Buffer.from([version, 0x00, 0x0a, 0x01]),
+      u32(sizes.length, 200),
+      perSample,
+    ]))
+  }
+
+  it('reads offsets, which is what distinguishes presentation order from decode order', () => {
+    // Without these, a B-frame stream plays pictures out of sequence: static areas stay
+    // sharp while anything moving smears.
+    const moof = box('moof', box('traf', Buffer.concat([tfhd(1), trunWithComposition(0, [10, 20, 30], [0, 6000, 3000])])))
+
+    expect(parseMoof(moof)[0]?.compositionOffsets).toEqual([0, 6000, 3000])
+  })
+
+  it('reads version 1 offsets as signed, so presentation may precede decode', () => {
+    const moof = box('moof', box('traf', Buffer.concat([tfhd(1), trunWithComposition(1, [10, 20], [-3000, 3000])])))
+
+    expect(parseMoof(moof)[0]?.compositionOffsets).toEqual([-3000, 3000])
+  })
+
+  it('still sums sample sizes correctly alongside the offsets', () => {
+    const moof = box('moof', box('traf', Buffer.concat([tfhd(1), trunWithComposition(0, [10, 20, 30], [0, 0, 0])])))
+
+    expect(parseMoof(moof)[0]?.totalBytes).toBe(60)
+  })
+
+  it('reports no offsets when the trun omits them', () => {
+    const moof = box('moof', box('traf', Buffer.concat([tfhd(1), trun(248, [100, 200])])))
+
+    expect(parseMoof(moof)[0]?.compositionOffsets).toEqual([])
   })
 })

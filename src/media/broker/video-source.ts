@@ -25,7 +25,8 @@ import { readTrackInfo } from '../fmp4/init-segment.js'
  * drops the stream onto synthesised timing. So the video byte range comes from the
  * `trun`, which is the only thing that actually knows where video ends.
  */
-export function videoPayload(segment: { data?: Buffer, moof?: Buffer }, videoTrackId: number | null): Buffer | null {
+export function videoTrack(segment: { data?: Buffer, moof?: Buffer }, videoTrackId: number | null):
+  { payload: Buffer, compositionOffsets: readonly number[] } | null {
   const data = segment.data
 
   if (!data) {
@@ -43,7 +44,7 @@ export function videoPayload(segment: { data?: Buffer, moof?: Buffer }, videoTra
       const end = start + video.totalBytes
 
       if ((start >= 0) && (end <= data.length)) {
-        return data.subarray(start, end)
+        return { compositionOffsets: video.compositionOffsets, payload: data.subarray(start, end) }
       }
     }
   }
@@ -53,7 +54,7 @@ export function videoPayload(segment: { data?: Buffer, moof?: Buffer }, videoTra
   // mismatch described above. A degraded stream beats no stream.
   for (const box of iterateBoxes(data)) {
     if (box.type === 'mdat') {
-      return box.body
+      return { compositionOffsets: [], payload: box.body }
     }
   }
 
@@ -89,6 +90,7 @@ export class VideoSource {
   readonly #videoTrackId: number | null
 
   #mismatches = 0
+  #sawComposition = false
 
   private constructor(
     config: AvcConfig,
@@ -216,13 +218,13 @@ export class VideoSource {
         continue
       }
 
-      const payload = videoPayload(segment, this.#videoTrackId)
+      const track = videoTrack(segment, this.#videoTrackId)
 
-      if (!payload) {
+      if (!track) {
         continue
       }
 
-      const units = splitAccessUnits(payload, this.#config)
+      const units = splitAccessUnits(track.payload, this.#config)
 
       if (units.length === 0) {
         continue
@@ -245,11 +247,21 @@ export class VideoSource {
       const timed = applyTimestamps(units, segment.timestamps, 0, step)
       const first = timed[0]?.timestamp ?? 0
 
-      for (const unit of timed) {
+      for (const [index, unit] of timed.entries()) {
         // Guard against a non-monotonic segment: never emit a timestamp below the clock.
         const offset = Math.max(0, unit.timestamp - first)
 
-        yield withParameterSets({ ...unit, timestamp: clock + offset }, this.#config)
+        // Presentation time, not decode time. With B-frames the two differ, and RTP
+        // carries presentation order — sending decode order plays pictures out of
+        // sequence, which reads as smearing on movement while static areas stay sharp.
+        const composition = track.compositionOffsets[index] ?? 0
+
+        if ((composition !== 0) && !this.#sawComposition) {
+          this.#sawComposition = true
+          this.#log.info('Stream uses B-frames; applying composition time offsets.')
+        }
+
+        yield withParameterSets({ ...unit, timestamp: clock + offset + composition }, this.#config)
       }
 
       const span = Math.max(0, (timed.at(-1)?.timestamp ?? first) - first)

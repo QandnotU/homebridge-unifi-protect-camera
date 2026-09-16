@@ -94,6 +94,32 @@ fi
 echo "Building ..."
 npm --prefix "$HERE" run build >/dev/null
 
+# A Ctrl-C in the terminal does not always take the Homebridge child with it, and the
+# orphan keeps the HAP port. Without this the next run dies on EADDRINUSE with a stack
+# trace that says nothing about the cause.
+PORT="$(node -e 'console.log(JSON.parse(require("fs").readFileSync(process.argv[1],"utf8")).bridge.port)' "$CONFIG")"
+STALE="$(lsof -nP -iTCP:"$PORT" -sTCP:LISTEN -t 2>/dev/null | head -1 || true)"
+
+if [ -n "$STALE" ]; then
+  echo "✗ Port $PORT is already held by PID $STALE — most likely a previous run of this"
+  echo "  script whose process outlived its terminal."
+  echo
+  ps -o pid,etime,command -p "$STALE" 2>/dev/null | cat
+  echo
+  read -r -p "Stop it and continue? [y/N] " REPLY
+
+  case "$REPLY" in
+    [yY]*)
+      kill "$STALE" 2>/dev/null || true
+      for _ in 1 2 3 4 5 6 7 8 9 10; do
+        lsof -nP -iTCP:"$PORT" -sTCP:LISTEN -t >/dev/null 2>&1 || break
+        sleep 0.5
+      done
+      ;;
+    *) echo "Leaving it alone. Nothing started."; exit 1 ;;
+  esac
+fi
+
 echo "Pairing PIN: $(node -e 'console.log(JSON.parse(require("fs").readFileSync(process.argv[1],"utf8")).bridge.pin)' "$CONFIG")"
 echo "Storage    : $DEV_DIR"
 echo "Ctrl-C to stop."

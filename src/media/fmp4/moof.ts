@@ -14,6 +14,18 @@ export interface TrackRun {
   readonly dataOffset: number
   readonly totalBytes: number
   readonly sampleCount: number
+  /**
+   * Per-sample composition time offsets: presentation time minus decode time, in the
+   * track's timescale.
+   *
+   * Non-zero only when the stream uses B-frames, where decode order differs from display
+   * order. RTP timestamps must carry *presentation* time, so ignoring these plays pictures
+   * in the wrong order — which looks like smearing on anything that moves while static
+   * parts of the frame stay perfectly sharp.
+   *
+   * Empty when the `trun` omits them, which means every offset is zero.
+   */
+  readonly compositionOffsets: readonly number[]
 }
 
 const TFHD_BASE_DATA_OFFSET = 0x000001
@@ -71,7 +83,14 @@ function parseTfhd(body: Buffer): Tfhd | null {
   return { defaultSampleSize, trackId }
 }
 
-function parseTrun(body: Buffer, defaultSampleSize: number): { dataOffset: number, sampleCount: number, totalBytes: number } | null {
+interface TrunResult {
+  dataOffset: number
+  sampleCount: number
+  totalBytes: number
+  compositionOffsets: number[]
+}
+
+function parseTrun(body: Buffer, defaultSampleSize: number): TrunResult | null {
   if (body.length < 8) {
     return null
   }
@@ -101,26 +120,40 @@ function parseTrun(body: Buffer, defaultSampleSize: number): { dataOffset: numbe
     + ((flags & TRUN_SAMPLE_FLAGS) ? 4 : 0)
     + ((flags & TRUN_SAMPLE_COMPOSITION_OFFSET) ? 4 : 0)
 
+  // In trun version 0 the composition offset is unsigned; version 1 makes it signed, which
+  // is how a stream signals that presentation can precede decode.
+  const version = body.readUInt8(0)
+
   let totalBytes = 0
+  const compositionOffsets: number[] = []
 
   for (let index = 0; index < sampleCount; index++) {
-    if (!(flags & TRUN_SAMPLE_SIZE)) {
-      totalBytes += defaultSampleSize
-      offset += perSample
-      continue
-    }
-
     const sizeOffset = offset + ((flags & TRUN_SAMPLE_DURATION) ? 4 : 0)
 
-    if ((sizeOffset + 4) > body.length) {
-      return null
+    if (flags & TRUN_SAMPLE_SIZE) {
+      if ((sizeOffset + 4) > body.length) {
+        return null
+      }
+
+      totalBytes += body.readUInt32BE(sizeOffset)
+    } else {
+      totalBytes += defaultSampleSize
     }
 
-    totalBytes += body.readUInt32BE(sizeOffset)
+    if (flags & TRUN_SAMPLE_COMPOSITION_OFFSET) {
+      const ctoOffset = offset + perSample - 4
+
+      if ((ctoOffset + 4) > body.length) {
+        return null
+      }
+
+      compositionOffsets.push((version === 0) ? body.readUInt32BE(ctoOffset) : body.readInt32BE(ctoOffset))
+    }
+
     offset += perSample
   }
 
-  return { dataOffset, sampleCount, totalBytes }
+  return { compositionOffsets, dataOffset, sampleCount, totalBytes }
 }
 
 /** Read every track fragment in a `moof` box. */
@@ -148,7 +181,13 @@ export function parseMoof(moof: Buffer): TrackRun[] {
           const run = parseTrun(child.body, header.defaultSampleSize)
 
           if (run) {
-            runs.push({ dataOffset: run.dataOffset, sampleCount: run.sampleCount, totalBytes: run.totalBytes, trackId: header.trackId })
+            runs.push({
+              compositionOffsets: run.compositionOffsets,
+              dataOffset: run.dataOffset,
+              sampleCount: run.sampleCount,
+              totalBytes: run.totalBytes,
+              trackId: header.trackId,
+            })
           }
         }
       }

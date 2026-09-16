@@ -1102,8 +1102,29 @@ library's types:
    synthesised timing. `trun` parsing is required; `media/fmp4/moof.ts` does it, keyed on
    the video track id from the init segment's `tkhd`.
 
-Still open: whether B-frames appear (none observed so far), the native GOP length, and
-whether SRTCP sender reports are needed for long sessions.
+**B-frames: none.** Every `trun` composition offset measured is zero, so decode order
+equals presentation order on this camera. The offsets are parsed and applied anyway
+(`media/fmp4/moof.ts`), since a camera that did use them would otherwise play pictures out
+of order — but on a G5 Bullet the code is a no-op.
+
+**SRTCP sender reports: required in practice.** Without them HomeKit renegotiated every
+session from 1280×720 down to 640×360 within about five seconds. With them it holds 720p
+for the length of the session. A receiver decodes RTP without sender reports but cannot
+map the media clock to wall time, so its jitter buffer is left estimating.
+
+**Do not starve the encoder to fit HomeKit's bitrate.** Protect's floor for the Medium
+channel is 750 Kbps, still well above the ~299 Kbps HomeKit negotiates for 720p — so
+passthrough can never match the negotiated ceiling on this hardware. Capping Medium at its
+750 Kbps floor to narrow the gap made things *worse*: the static parts of the frame stayed
+sharp while anything moving smeared, because the encoder had no bits left for motion. That
+presents almost exactly like packet loss and is not. Left at 2.0 Mbps the stream is smooth
+and HomeKit does not complain, despite sending roughly 525 Kbps against a 299 Kbps
+ceiling. The negotiated bitrate is a ceiling HomeKit tolerates being exceeded on a local
+network; encoder quality is not recoverable once thrown away.
+
+Still open: the native GOP length, and a small output jitter buffer to absorb the
+occasional late segment (Protect delivers ~3 pictures per 100 ms, so a late one shows as a
+brief hold followed by a catch-up).
 
 ---
 
