@@ -1,4 +1,4 @@
-import type { ProtectClient as ProtectClientType, ProtectLogging } from 'unifi-protect'
+import type { Camera, ProtectClient as ProtectClientType, ProtectLogging } from 'unifi-protect'
 
 import { FatalError, ProtectClient } from 'unifi-protect'
 
@@ -70,6 +70,14 @@ export class ProtectController {
 
   get cameras(): readonly CameraCapabilities[] {
     return this.#cameras
+  }
+
+  /**
+   * The live Protect device object for a camera, which owns snapshots, livestreams and
+   * talkback. Null before the controller connects.
+   */
+  camera(id: string): Camera | undefined {
+    return this.#client?.camera(id)
   }
 
   /**

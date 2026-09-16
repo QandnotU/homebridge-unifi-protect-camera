@@ -1,6 +1,7 @@
 import type { API, PlatformAccessory, Service } from 'homebridge'
 
 import type { CameraCapabilities } from '../protect/capabilities.js'
+import type { CameraRenderer } from '../homekit/renderers/renderer.js'
 import type { CameraEvent } from '../protect/events.js'
 import type { ScopedLogger } from '../core/logger.js'
 import { conformingAlternatives, describeTier, hasConformingFrameRate, joinOr } from '../protect/capabilities.js'
@@ -27,15 +28,17 @@ export interface CameraAccessoryContext extends Record<string, unknown> {
 /**
  * One Protect camera as a HomeKit accessory.
  *
- * Phase 1 scope: identity, motion and reachability. It owns no video — the camera
- * controller and streaming delegate attach in Phase 2, which is why this class stays
- * small rather than growing into the monolithic camera object the architecture warns
- * against.
+ * It owns identity, motion and reachability, and delegates the entire camera surface to a
+ * {@link CameraRenderer}. Keeping video behind that seam is what stops this class growing
+ * into the monolithic camera object the architecture warns against — and is what lets a
+ * future secure-video renderer be additive.
  */
 export class CameraAccessory {
   readonly #api: API
   readonly #log: ScopedLogger
   readonly #accessory: PlatformAccessory<CameraAccessoryContext>
+
+  readonly #renderer: CameraRenderer | null
 
   #capabilities: CameraCapabilities
   #motionTimer: NodeJS.Timeout | null = null
@@ -47,6 +50,7 @@ export class CameraAccessory {
     accessory: PlatformAccessory<CameraAccessoryContext>,
     capabilities: CameraCapabilities,
     controllerHost: string,
+    renderer: CameraRenderer | null = null,
   ) {
     this.#api = api
     this.#log = log.scope(capabilities.name)
@@ -58,9 +62,15 @@ export class CameraAccessory {
     accessory.context.mac = capabilities.mac
     accessory.context.schemaVersion = CONTEXT_SCHEMA_VERSION
 
+    this.#renderer = renderer
+
     this.#configureInformation()
     this.#configureMotion()
     this.#reportCapabilities()
+
+    // The renderer attaches the HomeKit camera surface. Exactly one is ever attached: the
+    // classic and secure-video service sets cannot coexist on one accessory.
+    renderer?.attach(accessory, capabilities)
   }
 
   get cameraId(): string {
@@ -69,6 +79,11 @@ export class CameraAccessory {
 
   get accessory(): PlatformAccessory<CameraAccessoryContext> {
     return this.#accessory
+  }
+
+  /** The current capability model. Read by the streaming delegate at session start. */
+  get capabilities(): CameraCapabilities {
+    return this.#capabilities
   }
 
   #configureInformation(): void {
@@ -150,6 +165,8 @@ export class CameraAccessory {
       this.#log.info('Stream configuration changed.')
       this.#reportCapabilities()
     }
+
+    this.#renderer?.update(capabilities)
   }
 
   /**
@@ -226,7 +243,8 @@ export class CameraAccessory {
     this.#motionService().updateCharacteristic(this.#api.hap.Characteristic.MotionDetected, false)
   }
 
-  dispose(): void {
+  async dispose(): Promise<void> {
     this.#releaseMotion()
+    await this.#renderer?.shutdown()
   }
 }

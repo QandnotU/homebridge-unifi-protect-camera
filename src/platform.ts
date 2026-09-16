@@ -7,6 +7,7 @@ import type { ResolvedConfig, ResolvedControllerConfig } from './types/config.js
 import type { ScopedLogger } from './core/logger.js'
 import { PLATFORM_NAME, PLUGIN_NAME } from './settings.js'
 import { CameraAccessory } from './accessories/camera-accessory.js'
+import { ClassicRenderer } from './homekit/renderers/classic-renderer.js'
 import { Lifecycle } from './core/lifecycle.js'
 import { ProtectController } from './protect/controller.js'
 import { createLogger } from './core/logger.js'
@@ -37,6 +38,9 @@ export class UniFiProtectCameraPlatform implements DynamicPlatformPlugin {
   private readonly cameraIndex = new Map<string, string>()
 
   private readonly controllers: ProtectController[] = []
+
+  /** Validated plugin options, available once `start` has run. */
+  private options: ResolvedConfig['options'] = { maximumQuality: false, verboseDiagnostics: false }
 
   constructor(log: Logging, platformConfig: PlatformConfig, api: API) {
     this.log = createLogger(log)
@@ -80,6 +84,8 @@ export class UniFiProtectCameraPlatform implements DynamicPlatformPlugin {
   }
 
   private start(config: ResolvedConfig): void {
+    this.options = config.options
+
     const count = config.controllers.length
 
     this.log.info('Starting with %s controller%s, %s cached accessor%s.',
@@ -96,7 +102,7 @@ export class UniFiProtectCameraPlatform implements DynamicPlatformPlugin {
       this.controllers.push(controller)
 
       controller.start({
-        onCameras: cameras => { this.syncCameras(controllerConfig, cameras) },
+        onCameras: cameras => { this.syncCameras(controller, controllerConfig, cameras) },
         onEvent: event => { this.routeEvent(event) },
         onReachability: reachable => { this.setReachability(controllerConfig, reachable) },
       })
@@ -107,7 +113,11 @@ export class UniFiProtectCameraPlatform implements DynamicPlatformPlugin {
    * Reconcile one controller's camera set against what HomeKit currently has: adopt cached
    * accessories, register new ones, prune the departed.
    */
-  private syncCameras(controllerConfig: ResolvedControllerConfig, cameras: readonly CameraCapabilities[]): void {
+  private syncCameras(
+    controller: ProtectController,
+    controllerConfig: ResolvedControllerConfig,
+    cameras: readonly CameraCapabilities[],
+  ): void {
     const log = this.log.scope(controllerConfig.name)
     const seen = new Set<string>()
 
@@ -123,6 +133,7 @@ export class UniFiProtectCameraPlatform implements DynamicPlatformPlugin {
         continue
       }
 
+      const renderer = this.buildRenderer(controller, capabilities, log)
       const cached = this.cachedAccessories.get(uuid)
 
       if (cached) {
@@ -130,7 +141,7 @@ export class UniFiProtectCameraPlatform implements DynamicPlatformPlugin {
         cached.displayName = capabilities.name
         log.info('Restored %s from cache.', capabilities.name)
 
-        const camera = new CameraAccessory(this.api, log, cached, capabilities, controllerConfig.host)
+        const camera = new CameraAccessory(this.api, log, cached, capabilities, controllerConfig.host, renderer)
 
         this.cameras.set(uuid, camera)
         this.cameraIndex.set(capabilities.id, uuid)
@@ -139,7 +150,7 @@ export class UniFiProtectCameraPlatform implements DynamicPlatformPlugin {
       }
 
       const accessory = new this.api.platformAccessory<CameraAccessoryContext>(capabilities.name, uuid)
-      const camera = new CameraAccessory(this.api, log, accessory, capabilities, controllerConfig.host)
+      const camera = new CameraAccessory(this.api, log, accessory, capabilities, controllerConfig.host, renderer)
 
       this.cameras.set(uuid, camera)
       this.cameraIndex.set(capabilities.id, uuid)
@@ -148,6 +159,38 @@ export class UniFiProtectCameraPlatform implements DynamicPlatformPlugin {
     }
 
     this.pruneDeparted(controllerConfig, seen, cameras.length, log)
+  }
+
+  /**
+   * Build the HomeKit camera surface for one camera.
+   *
+   * Returns null when the Protect device object is not available yet — the accessory is
+   * still registered with identity and motion, so the camera exists in the Home app and
+   * gains video at the next restart rather than disappearing.
+   */
+  private buildRenderer(
+    controller: ProtectController,
+    capabilities: CameraCapabilities,
+    log: ScopedLogger,
+  ): ClassicRenderer | null {
+    const device = controller.camera(capabilities.id)
+
+    if (!device) {
+      log.warn('%s: the Protect device is not available yet, so live video is not configured this run.', capabilities.name)
+
+      return null
+    }
+
+    return new ClassicRenderer({
+      api: this.api,
+      camera: device,
+      // Read through the live accessory so the delegate always sees current channel data.
+      capabilities: () => this.cameras.get(this.api.hap.uuid.generate(capabilities.mac))?.capabilities ?? capabilities,
+      lifecycle: this.lifecycle,
+      log: log.scope(capabilities.name),
+      maximumQuality: this.options.maximumQuality,
+      verboseDiagnostics: this.options.verboseDiagnostics,
+    })
   }
 
   /**
@@ -185,7 +228,7 @@ export class UniFiProtectCameraPlatform implements DynamicPlatformPlugin {
         continue
       }
 
-      camera.dispose()
+      void camera.dispose()
       this.cameras.delete(uuid)
       this.cameraIndex.delete(camera.cameraId)
       stale.push(camera.accessory)
@@ -233,10 +276,7 @@ export class UniFiProtectCameraPlatform implements DynamicPlatformPlugin {
   private async stop(): Promise<void> {
     this.log.debug('Shutting down.')
 
-    for (const camera of this.cameras.values()) {
-      camera.dispose()
-    }
-
+    await Promise.all([...this.cameras.values()].map(camera => camera.dispose()))
     await Promise.all(this.controllers.map(controller => controller.dispose()))
     await this.lifecycle.dispose()
   }
