@@ -1,5 +1,5 @@
 import type { AvcConfig } from './avcc.js'
-import { NalType, isKeyframe, isParameterSet, iterateNalUnits, nalType } from './avcc.js'
+import { NalType, firstMacroblockInSlice, isKeyframe, isParameterSet, iterateNalUnits, nalType } from './avcc.js'
 
 /**
  * One decoded picture's worth of NAL units, ready to packetize.
@@ -22,13 +22,29 @@ function isVideoCodingLayer(nal: Buffer): boolean {
 }
 
 /**
+ * Whether a coded slice begins a new picture rather than continuing the current one.
+ *
+ * A multi-slice picture produces several VCL NALs, and only its first slice has
+ * `first_mb_in_slice == 0`. When the field cannot be read we assume a new picture, since
+ * merging two pictures is the worse failure of the two.
+ */
+function startsNewPicture(nal: Buffer): boolean {
+  const first = firstMacroblockInSlice(nal)
+
+  return (first === null) || (first === 0)
+}
+
+/**
  * Split an `mdat` payload into access units.
  *
  * A new access unit begins at an access unit delimiter, at a parameter set or SEI that
- * follows picture data, or at the second and subsequent coded slices. This is the
- * conservative reading of ISO/IEC 14496-10 §7.4.1.2.3 — it never merges two pictures,
- * which would desynchronise RTP timestamps and produce the stutter that looks like a
- * network problem but is not.
+ * follows picture data, or at a coded slice whose `first_mb_in_slice` is zero
+ * (ISO/IEC 14496-10 §7.4.1.2.3).
+ *
+ * That last condition is the subtle one. Treating *every* coded slice as a new picture
+ * works for single-slice streams and quietly breaks multi-slice ones: it yields more
+ * access units than the controller reports timestamps for, so the timing falls back to
+ * approximation and the decoder receives fragments of pictures rather than whole ones.
  */
 export function splitAccessUnits(payload: Buffer, config: AvcConfig): AccessUnit[] {
   const units: AccessUnit[] = []
@@ -50,7 +66,7 @@ export function splitAccessUnits(payload: Buffer, config: AvcConfig): AccessUnit
     const type = nalType(nal)
     const startsNewUnit = (type === NalType.AUD)
       || (sawPictureData && (isParameterSet(nal) || (type === NalType.SEI)))
-      || (sawPictureData && isVideoCodingLayer(nal))
+      || (sawPictureData && isVideoCodingLayer(nal) && startsNewPicture(nal))
 
     if (startsNewUnit) {
       flush()

@@ -226,3 +226,75 @@ export function formatProfile(profile: number): string {
     default: return `profile ${profile.toString()}`
   }
 }
+
+/**
+ * Read an unsigned Exp-Golomb value (`ue(v)`) starting at a bit offset.
+ *
+ * Returns null if the buffer runs out, rather than throwing on a truncated NAL.
+ */
+function readUnsignedExpGolomb(data: Buffer, startBit: number): number | null {
+  let bit = startBit
+  let leadingZeros = 0
+
+  for (;;) {
+    const byteIndex = bit >> 3
+
+    if (byteIndex >= data.length) {
+      return null
+    }
+
+    const value = ((data[byteIndex] ?? 0) >> (7 - (bit & 7))) & 1
+
+    bit += 1
+
+    if (value === 1) {
+      break
+    }
+
+    leadingZeros += 1
+
+    // Beyond this the value cannot be represented, and the NAL is not what we think.
+    if (leadingZeros > 31) {
+      return null
+    }
+  }
+
+  let remainder = 0
+
+  for (let index = 0; index < leadingZeros; index++) {
+    const byteIndex = bit >> 3
+
+    if (byteIndex >= data.length) {
+      return null
+    }
+
+    remainder = (remainder * 2) + (((data[byteIndex] ?? 0) >> (7 - (bit & 7))) & 1)
+    bit += 1
+  }
+
+  return ((2 ** leadingZeros) - 1) + remainder
+}
+
+/**
+ * `first_mb_in_slice` from a coded slice NAL, or null if it cannot be read.
+ *
+ * This is the first field of the slice header (ISO/IEC 14496-10 §7.3.3), immediately after
+ * the one-byte NAL header. It is what distinguishes the start of a new picture from a
+ * continuation of the current one: a picture encoded as several slices produces several
+ * VCL NALs, and only the first of them has `first_mb_in_slice == 0`.
+ *
+ * Treating every slice as a new picture — which is the obvious reading if you have only
+ * ever seen single-slice streams — splits one picture into several access units. Each
+ * fragment then carries its own timestamp and its own RTP marker bit, and the decoder is
+ * handed partial pictures.
+ *
+ * Emulation prevention bytes are not stripped. They require a `00 00 03` sequence, which
+ * cannot occur this early in a slice header for any real stream.
+ */
+export function firstMacroblockInSlice(nal: Buffer): number | null {
+  if (nal.length < 2) {
+    return null
+  }
+
+  return readUnsignedExpGolomb(nal, 8)
+}

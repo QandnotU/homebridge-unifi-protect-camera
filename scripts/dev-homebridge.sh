@@ -97,6 +97,29 @@ npm --prefix "$HERE" run build >/dev/null
 # A Ctrl-C in the terminal does not always take the Homebridge child with it, and the
 # orphan keeps the HAP port. Without this the next run dies on EADDRINUSE with a stack
 # trace that says nothing about the cause.
+# Keep bridge.bind on whatever interface currently reaches the LAN. Pinning it once at
+# config creation means a cable swap silently leaves HAP advertising on the old interface,
+# and the Home app then cannot reach the bridge at all.
+PRIMARY_IFACE="$(route -n get default 2>/dev/null | awk '/interface:/{print $2}')"
+
+if [ -n "$PRIMARY_IFACE" ]; then
+  PRIMARY_IFACE="$PRIMARY_IFACE" node -e '
+    const fs = require("fs")
+    const path = process.argv[1]
+    const config = JSON.parse(fs.readFileSync(path, "utf8"))
+    const want = process.env.PRIMARY_IFACE
+    const have = (config.bridge.bind ?? [])[0]
+
+    if (have !== want) {
+      config.bridge.bind = [want]
+      fs.writeFileSync(path, JSON.stringify(config, null, 2) + "\n", { mode: 0o600 })
+      console.log(`Bind       : ${want} (was ${have ?? "unset"})`)
+    } else {
+      console.log(`Bind       : ${want}`)
+    }
+  ' "$CONFIG"
+fi
+
 PORT="$(node -e 'console.log(JSON.parse(require("fs").readFileSync(process.argv[1],"utf8")).bridge.port)' "$CONFIG")"
 STALE="$(lsof -nP -iTCP:"$PORT" -sTCP:LISTEN -t 2>/dev/null | head -1 || true)"
 

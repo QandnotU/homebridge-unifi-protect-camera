@@ -25,6 +25,16 @@ function nal(header: number, length = 8): Buffer {
   return buffer
 }
 
+/** A slice that begins a picture: `first_mb_in_slice` of zero. */
+function firstSlice(header: number): Buffer {
+  return Buffer.from([header, 0x80, 0xcd, 0xcd, 0xcd, 0xcd, 0xcd, 0xcd])
+}
+
+/** A continuation slice of the same picture: `first_mb_in_slice` above zero. */
+function continuationSlice(header: number): Buffer {
+  return Buffer.from([header, 0x40, 0xcd, 0xcd, 0xcd, 0xcd, 0xcd, 0xcd])
+}
+
 const IDR = nal(0x65)
 const SLICE = nal(0x41)
 const SEI = nal(0x06)
@@ -136,5 +146,42 @@ describe('withParameterSets', () => {
     const units = splitAccessUnits(mdat([IDR, SLICE]), config)
 
     expect(withParameterSets(units[1]!, config).nals).toHaveLength(1)
+  })
+})
+
+describe('multi-slice pictures', () => {
+  it('keeps the slices of one picture in a single access unit', () => {
+    // The bug this guards: treating every coded slice as a new picture produced more
+    // access units than the controller reported timestamps for, dropping the stream onto
+    // approximate timing and handing the decoder fragments of pictures.
+    const units = splitAccessUnits(mdat([firstSlice(0x65), continuationSlice(0x65), continuationSlice(0x65)]), config)
+
+    expect(units).toHaveLength(1)
+    expect(units[0]?.nals).toHaveLength(3)
+    expect(units[0]?.keyframe).toBe(true)
+  })
+
+  it('starts a new access unit at the next picture\'s first slice', () => {
+    const units = splitAccessUnits(mdat([
+      firstSlice(0x65), continuationSlice(0x65),
+      firstSlice(0x41), continuationSlice(0x41),
+    ]), config)
+
+    expect(units).toHaveLength(2)
+    expect(units.map(u => u.nals.length)).toEqual([2, 2])
+    expect(units.map(u => u.keyframe)).toEqual([true, false])
+  })
+
+  it('still splits single-slice pictures one per access unit', () => {
+    const units = splitAccessUnits(mdat([firstSlice(0x65), firstSlice(0x41), firstSlice(0x41)]), config)
+
+    expect(units).toHaveLength(3)
+  })
+
+  it('treats an unreadable slice header as a new picture, never merging two', () => {
+    // Merging two pictures is the worse failure, so an unreadable header errs that way.
+    const units = splitAccessUnits(mdat([firstSlice(0x65), Buffer.from([0x41])]), config)
+
+    expect(units).toHaveLength(2)
   })
 })

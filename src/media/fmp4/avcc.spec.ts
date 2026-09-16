@@ -1,8 +1,8 @@
 import { describe, expect, it } from 'vitest'
 
 import {
-  formatLevel, formatProfile, isKeyframe, isParameterSet, iterateNalUnits,
-  macroblocks, minimumLevelFor, nalType, parseAvcC, readAvcConfig, toAnnexB,
+  firstMacroblockInSlice, formatLevel, formatProfile, isKeyframe, isParameterSet,
+  iterateNalUnits, macroblocks, minimumLevelFor, nalType, parseAvcC, readAvcConfig, toAnnexB,
 } from './avcc.js'
 
 /** Build an ISO BMFF box around a body. */
@@ -186,5 +186,26 @@ describe('formatting', () => {
     expect(formatProfile(77)).toBe('Main')
     expect(formatProfile(100)).toBe('High')
     expect(formatProfile(244)).toBe('profile 244')
+  })
+})
+
+describe('firstMacroblockInSlice', () => {
+  it('reads zero, which marks the first slice of a picture', () => {
+    // 0x80 is Exp-Golomb '1' — the value zero.
+    expect(firstMacroblockInSlice(Buffer.from([0x41, 0x80]))).toBe(0)
+  })
+
+  it('reads a non-zero value, which marks a continuation slice', () => {
+    // 0x40 is '010' — the value one.
+    expect(firstMacroblockInSlice(Buffer.from([0x41, 0x40]))).toBe(1)
+    // 0x20 is '00100' — the value three.
+    expect(firstMacroblockInSlice(Buffer.from([0x41, 0x20]))).toBe(3)
+  })
+
+  it('returns null rather than throwing on a truncated NAL', () => {
+    expect(firstMacroblockInSlice(Buffer.from([0x41]))).toBeNull()
+    expect(firstMacroblockInSlice(Buffer.alloc(0))).toBeNull()
+    // All zero bits: a leading-zero run with no terminator.
+    expect(firstMacroblockInSlice(Buffer.from([0x41, 0x00, 0x00, 0x00, 0x00, 0x00]))).toBeNull()
   })
 })

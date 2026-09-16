@@ -4,7 +4,10 @@ import type {
 } from 'homebridge'
 import type { Camera } from 'unifi-protect'
 
+import { createWriteStream } from 'node:fs'
+import { join } from 'node:path'
 import { randomInt } from 'node:crypto'
+import type { WriteStream } from 'node:fs'
 
 import type { CameraCapabilities } from '../protect/capabilities.js'
 import type { Lifecycle } from '../core/lifecycle.js'
@@ -17,6 +20,7 @@ import { SrtpSession } from '../media/rtp/srtp.js'
 import { VideoSource } from '../media/broker/video-source.js'
 import { delay, isAbortError } from '../core/lifecycle.js'
 import { selectStream } from '../media/select/stream-selector.js'
+import { toAnnexB } from '../media/fmp4/avcc.js'
 import { RTP_VIDEO_CLOCK, toRtpTimestamp } from '../media/fmp4/init-segment.js'
 
 /**
@@ -56,6 +60,40 @@ const PACING_MAX_WAIT_MS = 250
  * is accepted, and delivery stays even from there.
  */
 const PACING_RESYNC_MS = 400
+
+/**
+ * Set `PROTECT_DUMP_DIR` to write each session's video to an Annex-B `.h264` file.
+ *
+ * This is the only way to tell a demuxing fault from a transport fault. Whatever lands in
+ * the file is exactly what we hand the packetizer: if it plays back cleanly, the pictures
+ * we produce are correct and any corruption is happening on the wire; if the file itself
+ * is broken, the fault is upstream of RTP entirely.
+ *
+ *   PROTECT_DUMP_DIR=/tmp/protect bash scripts/dev-homebridge.sh
+ *   ffplay /tmp/protect/<session>.h264
+ */
+const DUMP_DIR = process.env['PROTECT_DUMP_DIR'] ?? ''
+
+/**
+ * How many pauses a single frame's packets may be broken up with.
+ *
+ * A keyframe captured during movement was measured at 107 KB — 79 packets — and releasing
+ * those with no gap puts roughly 109 KB on the wire at once, far above the stream's
+ * 569 Kbps average. Enough of that burst is lost that the keyframe is damaged, and every
+ * picture referencing it stays corrupt until the next one.
+ *
+ * The count is bounded rather than the group size, because the cost of a pause is not the
+ * millisecond requested. Node's timers resolve to whole milliseconds and overshoot under
+ * load, so a pause costs 1–4 ms in practice. Spacing every eight packets meant nine pauses
+ * for that keyframe — up to 36 ms, past its 33 ms budget at 30 fps. The sender then fell
+ * further behind the media clock on every large frame until a resync caught it up in one
+ * burst: better at first, then degrading. Four pauses cost at most ~16 ms and still break
+ * the frame into fifths.
+ */
+const MAX_FRAME_PAUSES = 4
+
+/** Below this, a frame is small enough to send in one go. Median frame is ~1.6 KB. */
+const PAUSE_ABOVE_PACKETS = 8
 
 /** The start variant of {@link StreamingRequest}, which is the one carrying full video info. */
 type StartStreamRequest = Extract<StreamingRequest, { video: VideoInfo }>
@@ -289,6 +327,13 @@ export class ProtectStreamingDelegate implements CameraStreamingDelegate {
     const packetizer = new H264Packetizer({ maxPayloadSize: maxPayloadSize(mtu), payloadType, ssrc: session.ssrc })
 
     let lastTimestamp = 0
+    let dump: WriteStream | null = null
+
+    if (DUMP_DIR) {
+      dump = createWriteStream(join(DUMP_DIR, `${sessionId}.h264`))
+      session.lifecycle.add(() => { dump?.end() })
+      this.#log.info('Writing this session\'s video to %s', join(DUMP_DIR, `${sessionId}.h264`))
+    }
 
     // Counted here rather than read from the socket: the socket also carries the sender
     // reports themselves, and RFC 3550's octet count excludes RTP headers. Taking the
@@ -396,12 +441,28 @@ export class ProtectStreamingDelegate implements CameraStreamingDelegate {
               pacingStart = performance.now()
             }
 
+            dump?.write(toAnnexB(unit.nals))
+
             const packets = packetizer.packetizeAccessUnit(unit.nals, lastTimestamp)
 
-            for (const packet of packets) {
+            // Break a large frame into at most MAX_FRAME_PAUSES + 1 groups; small frames
+            // go out in one piece.
+            const groupSize = (packets.length > PAUSE_ABOVE_PACKETS)
+              ? Math.ceil(packets.length / (MAX_FRAME_PAUSES + 1))
+              : packets.length
+
+            for (const [index, packet] of packets.entries()) {
               rtpPackets += 1
               rtpOctets += packet.length - RTP_HEADER_SIZE
               session.videoSender.send(session.srtp.protect(packet))
+
+              if (((index + 1) % groupSize === 0) && ((index + 1) < packets.length)) {
+                try {
+                  await delay(1, session.lifecycle.signal)
+                } catch {
+                  return
+                }
+              }
             }
 
             session.metrics.markFirstPacket()
