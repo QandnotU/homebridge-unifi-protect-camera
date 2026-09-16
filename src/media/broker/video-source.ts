@@ -83,14 +83,18 @@ export class VideoSource {
   readonly #config: AvcConfig
   readonly #track: TrackInfo
   readonly #subscription: AsyncIterable<{ type: string, data?: Buffer, mdat?: Buffer, moof?: Buffer, timestamps?: number[] }>
+    & { stats?: { delivered: number, discarded: number, peakQueueDepth: number, queueDepth: number } }
   readonly #log: ScopedLogger
   readonly #fps: number
   readonly #videoTrackId: number | null
 
+  #mismatches = 0
+
   private constructor(
     config: AvcConfig,
     track: TrackInfo,
-    subscription: AsyncIterable<{ type: string, data?: Buffer, mdat?: Buffer, moof?: Buffer, timestamps?: number[] }>,
+    subscription: AsyncIterable<{ type: string, data?: Buffer, mdat?: Buffer, moof?: Buffer, timestamps?: number[] }>
+      & { stats?: { delivered: number, discarded: number, peakQueueDepth: number, queueDepth: number } },
     log: ScopedLogger,
     fps: number,
     videoTrackId: number | null,
@@ -168,16 +172,44 @@ export class VideoSource {
   }
 
   /**
-   * Yield access units as they arrive.
+   * Upstream queue health. `discarded` above zero means we are not draining Protect fast
+   * enough and segments are being dropped before we ever see them — which presents as the
+   * stream freezing and then catching up.
+   */
+  get stats(): { delivered: number, discarded: number, peakQueueDepth: number, queueDepth: number } | null {
+    return this.#subscription.stats ?? null
+  }
+
+  /**
+   * Yield access units on a continuous, strictly increasing timeline.
    *
-   * Keyframes are given the parameter sets a decoder needs, because Protect keeps SPS and
-   * PPS in the init segment and a HomeKit client joining mid-stream never saw it.
+   * Protect's decode timestamps are **segment-relative**, not a stream clock. Measured
+   * against a live camera, each segment restarts near zero:
+   *
+   * ```
+   *   segment 1:   0, 3000, 6000, 9000
+   *   segment 2: 133, 3133, 6133
+   *   segment 3: 233, 3233, 6233
+   * ```
+   *
+   * Within a segment the step is exactly one frame (3000 ticks at 30 fps on a 90 kHz
+   * timescale), but the base creeps by about 100 ticks per segment while the segment
+   * itself covers 9000. Passing those through as RTP timestamps makes the clock jump
+   * backwards on every segment boundary, and a receiver treats that as a discontinuity —
+   * the picture updates once every several seconds while we happily send 30 fps.
+   *
+   * So the per-segment offsets are used for *intra*-segment spacing, which they describe
+   * correctly, and the segments are laid end to end on our own running clock.
+   *
+   * Keyframes are also given the parameter sets a decoder needs, because Protect keeps SPS
+   * and PPS in the init segment and a client joining mid-stream never saw it.
    */
   async *accessUnits(): AsyncGenerator<AccessUnit> {
-    // One frame's worth of ticks, used only when the controller sends no timestamps.
+    // One frame's worth of ticks: the gap left between segments, and the fallback spacing
+    // when the controller sends no timestamps at all.
     const step = Math.max(1, Math.round(this.#track.timescale / Math.max(1, this.#fps)))
 
-    let nextFallback = 0
+    let clock = 0
 
     for await (const segment of this.#subscription) {
       if ((segment.type !== 'media') || !segment.mdat) {
@@ -196,13 +228,33 @@ export class VideoSource {
         continue
       }
 
-      const timed = applyTimestamps(units, segment.timestamps, nextFallback, step)
+      const supplied = segment.timestamps?.length ?? 0
 
-      nextFallback = (timed.at(-1)?.timestamp ?? nextFallback) + step
+      if ((supplied > 0) && (supplied !== units.length)) {
+        // The splitter and the controller disagree about how many pictures this segment
+        // holds. One of them is wrong, and the resulting timing is a guess either way —
+        // which shows up as corruption rather than as an error.
+        this.#mismatches += 1
+
+        if (this.#mismatches <= 5) {
+          this.#log.warn('Segment holds %s access units but %s timestamps; timing for it is approximate.',
+            units.length.toString(), supplied.toString())
+        }
+      }
+
+      const timed = applyTimestamps(units, segment.timestamps, 0, step)
+      const first = timed[0]?.timestamp ?? 0
 
       for (const unit of timed) {
-        yield withParameterSets(unit, this.#config)
+        // Guard against a non-monotonic segment: never emit a timestamp below the clock.
+        const offset = Math.max(0, unit.timestamp - first)
+
+        yield withParameterSets({ ...unit, timestamp: clock + offset }, this.#config)
       }
+
+      const span = Math.max(0, (timed.at(-1)?.timestamp ?? first) - first)
+
+      clock += span + step
     }
 
     this.#log.debug('Protect stream ended.')

@@ -9,14 +9,15 @@ import { randomInt } from 'node:crypto'
 import type { CameraCapabilities } from '../protect/capabilities.js'
 import type { Lifecycle } from '../core/lifecycle.js'
 import type { ScopedLogger } from '../core/logger.js'
-import { H264Packetizer, maxPayloadSize } from '../media/rtp/h264-packetizer.js'
+import { H264Packetizer, RTP_HEADER_SIZE, maxPayloadSize } from '../media/rtp/h264-packetizer.js'
 import { RtpSender } from '../media/rtp/sender.js'
 import { SessionMetrics } from '../diagnostics/session-metrics.js'
+import { SrtcpSession } from '../media/rtp/srtcp.js'
 import { SrtpSession } from '../media/rtp/srtp.js'
 import { VideoSource } from '../media/broker/video-source.js'
-import { isAbortError } from '../core/lifecycle.js'
+import { delay, isAbortError } from '../core/lifecycle.js'
 import { selectStream } from '../media/select/stream-selector.js'
-import { toRtpTimestamp } from '../media/fmp4/init-segment.js'
+import { RTP_VIDEO_CLOCK, toRtpTimestamp } from '../media/fmp4/init-segment.js'
 
 /**
  * HAP's `StreamRequestTypes` is an *ambient const enum*, which `verbatimModuleSyntax`
@@ -28,6 +29,33 @@ import { toRtpTimestamp } from '../media/fmp4/init-segment.js'
  */
 const START = 'start'
 const RECONFIGURE = 'reconfigure'
+
+/**
+ * How far ahead of the media clock the sender may run before it waits.
+ *
+ * Protect delivers roughly three pictures per 100 ms segment, and releasing them all at
+ * once produces a burst well above the stream's average rate. On a moving scene those
+ * pictures are large, and the burst overruns the receiver's buffer — which shows up as
+ * corruption concentrated in the moving parts of the frame, and provokes HomeKit into
+ * renegotiating down to a lower resolution.
+ *
+ * Pacing to the media clock spreads them evenly instead. This is what a conventional RTP
+ * sender does; we only notice its absence because the source arrives in bursts.
+ */
+const PACING_LEAD_MS = 8
+
+/** Never wait longer than this, so a timestamp jump cannot stall the stream. */
+const PACING_MAX_WAIT_MS = 250
+
+/**
+ * How far behind schedule the sender may fall before it stops trying to catch up.
+ *
+ * Catching up means transmitting the backlog as fast as the loop runs, which is the burst
+ * that pacing exists to avoid — the stream freezes and then races, shedding packets as it
+ * goes. Past this point the schedule is re-anchored instead: the latency already incurred
+ * is accepted, and delivery stays even from there.
+ */
+const PACING_RESYNC_MS = 400
 
 /** The start variant of {@link StreamingRequest}, which is the one carrying full video info. */
 type StartStreamRequest = Extract<StreamingRequest, { video: VideoInfo }>
@@ -50,7 +78,13 @@ interface PreparedSession {
   readonly videoSender: RtpSender
   readonly audioSender: RtpSender
   readonly srtp: SrtpSession
+  readonly srtcp: SrtcpSession
   readonly ssrc: number
+  /**
+   * Channel the pump should switch to, set when HomeKit reconfigures the session.
+   * Mutable by design: the pump is a long-running loop and this is how it is steered.
+   */
+  readonly control: { pendingChannelId: number | null }
 }
 
 export interface StreamingDelegateOptions {
@@ -119,8 +153,10 @@ export class ProtectStreamingDelegate implements CameraStreamingDelegate {
 
         const ssrc = randomInt(1, 0xffffffff)
         const srtp = new SrtpSession(request.video.srtp_key, request.video.srtp_salt, ssrc)
+        const srtcp = new SrtcpSession(request.video.srtp_key, request.video.srtp_salt, ssrc)
 
-        this.#sessions.set(request.sessionID, { audioSender, lifecycle, metrics, srtp, ssrc, videoSender })
+        this.#sessions.set(request.sessionID,
+          { audioSender, control: { pendingChannelId: null }, lifecycle, metrics, srtcp, srtp, ssrc, videoSender })
 
         callback(undefined, {
           audio: {
@@ -150,11 +186,31 @@ export class ProtectStreamingDelegate implements CameraStreamingDelegate {
       const session = this.#sessions.get(request.sessionID)
 
       if (session) {
-        // Recorded, not acted on: HomeKit's adaptive step-downs are what we are trying to
-        // observe, and re-selecting mid-session would hide them.
-        session.metrics.markReconfigure(request.video.width, request.video.height, request.video.max_bit_rate * 1000)
-        this.#log.debug('HomeKit reconfigured to %sx%s at %s kbps',
-          request.video.width.toString(), request.video.height.toString(), request.video.max_bit_rate.toString())
+        const { height, max_bit_rate: maxBitrate, width } = request.video
+
+        session.metrics.markReconfigure(width, height, maxBitrate * 1000)
+
+        // Act on it. HomeKit steps a session down within seconds of opening it, and a
+        // client that has renegotiated to 640x360 stops accepting the 1280x720 it was
+        // receiving — the picture simply freezes. Recording the change without honouring
+        // it was the cause.
+        const capabilities = this.#options.capabilities()
+        // A reconfigure carries no frame rate — only dimensions and a bitrate ceiling — so
+        // the selector is asked for the highest rate HomeKit negotiates and picks the
+        // channel on size, which is what actually decides the source.
+        const selection = selectStream(
+          { fps: 30, height, maxBitrate: maxBitrate * 1000, width },
+          capabilities.tiers,
+          { codec: capabilities.codec, maximumQuality: this.#options.maximumQuality },
+        )
+
+        if (selection && !selection.mode.endsWith('transcode')) {
+          session.control.pendingChannelId = selection.tier.channelId
+        }
+
+        this.#log.info('HomeKit reconfigured to %sx%s at %s Kbps -> %s channel',
+          width.toString(), height.toString(), maxBitrate.toString(),
+          selection?.tier.channelName ?? 'unchanged')
       }
 
       callback()
@@ -216,44 +272,157 @@ export class ProtectStreamingDelegate implements CameraStreamingDelegate {
     void this.#pump(request.sessionID, session, selection.tier.channelId, video.mtu, video.pt)
   }
 
+  /**
+   * Stream until the session ends, switching source when HomeKit reconfigures.
+   *
+   * The packetizer and SRTP session persist across a switch so RTP sequence numbers stay
+   * continuous, and timestamps are offset so they never move backwards — a receiver
+   * treats a backwards jump as a new stream and stalls.
+   */
   async #pump(
     sessionId: string,
     session: PreparedSession,
-    channelId: number,
+    initialChannelId: number,
     mtu: number,
     payloadType: number,
   ): Promise<void> {
+    const packetizer = new H264Packetizer({ maxPayloadSize: maxPayloadSize(mtu), payloadType, ssrc: session.ssrc })
+
+    let lastTimestamp = 0
+
+    // Counted here rather than read from the socket: the socket also carries the sender
+    // reports themselves, and RFC 3550's octet count excludes RTP headers. Taking the
+    // socket's totals would make every report overstate the stream it describes.
+    let rtpPackets = 0
+    let rtpOctets = 0
+
+    // RFC 3550 puts the minimum reporting interval at five seconds for a session this
+    // small. The receiver needs at least one report early to relate our media clock to
+    // wall time, so the first goes out a second in.
+    const report = (): void => { this.#sendReport(session, lastTimestamp, rtpPackets, rtpOctets) }
+    const reporter = setInterval(report, 5_000)
+    const firstReport = setTimeout(report, 1_000)
+
+    session.lifecycle.add(() => {
+      clearInterval(reporter)
+      clearTimeout(firstReport)
+    })
+
+    let channelId = initialChannelId
+    let timestampOffset = 0
+    let pacingBase: number | null = null
+    let pacingStart: number | null = null
+    let resyncs = 0
+    let first = true
+
     try {
-      const source = await VideoSource.open({
-        camera: this.#options.camera,
-        channelId,
-        fps: this.#options.capabilities().tiers.find(tier => tier.channelId === channelId)?.fps ?? 30,
-        log: this.#log,
-        signal: session.lifecycle.signal,
-      })
+      while (!session.lifecycle.signal.aborted) {
+        session.control.pendingChannelId = null
 
-      session.metrics.markSourceOpen()
+        const generation = session.lifecycle.child()
 
-      const packetizer = new H264Packetizer({
-        maxPayloadSize: maxPayloadSize(mtu),
-        payloadType,
-        ssrc: session.ssrc,
-      })
+        try {
+          const tier = this.#options.capabilities().tiers.find(entry => entry.channelId === channelId)
+          const source = await VideoSource.open({
+            camera: this.#options.camera,
+            channelId,
+            fps: tier?.fps ?? 30,
+            log: this.#log,
+            signal: generation.signal,
+          })
 
-      for await (const unit of source.accessUnits()) {
-        if (session.lifecycle.signal.aborted) {
-          break
+          if (first) {
+            session.metrics.markSourceOpen()
+          }
+
+          // After a switch, resume the RTP clock where it left off.
+          let base: number | null = null
+          // Wait for a keyframe before sending anything, on every generation including the
+          // first. Protect hands us whatever point of the GOP the stream happens to be at,
+          // so a session that starts mid-GOP begins with inter-coded pictures referencing
+          // frames the decoder has never seen. That decodes as visible corruption until
+          // the next IDR arrives.
+          let ready = false
+
+          session.lifecycle.add(() => {
+            const upstream = source.stats
+
+            this.#log.info('Stream health: %s pacing resync%s, upstream queue peak %s, %s segment%s discarded.',
+              resyncs.toString(), resyncs === 1 ? '' : 's',
+              String(upstream?.peakQueueDepth ?? 0),
+              String(upstream?.discarded ?? 0), (upstream?.discarded === 1) ? '' : 's')
+          })
+
+          for await (const unit of source.accessUnits()) {
+            if (session.lifecycle.signal.aborted) {
+              return
+            }
+
+            if ((session.control.pendingChannelId !== null) && (session.control.pendingChannelId !== channelId)) {
+              break
+            }
+
+            if (!ready) {
+              if (!unit.keyframe) {
+                continue
+              }
+
+              ready = true
+            }
+
+            base ??= unit.timestamp
+
+            const relative = toRtpTimestamp(unit.timestamp - base, source.track.timescale)
+
+            lastTimestamp = timestampOffset + relative
+            session.metrics.markAccessUnit(unit.keyframe)
+
+            // Pace to the media clock rather than to the arrival of segments.
+            pacingBase ??= lastTimestamp
+            pacingStart ??= performance.now()
+
+            const dueAt = pacingStart + (((lastTimestamp - pacingBase) / RTP_VIDEO_CLOCK) * 1000)
+            const wait = dueAt - performance.now()
+
+            if (wait > PACING_LEAD_MS) {
+              try {
+                await delay(Math.min(wait, PACING_MAX_WAIT_MS), session.lifecycle.signal)
+              } catch {
+                return
+              }
+            } else if (wait < -PACING_RESYNC_MS) {
+              resyncs += 1
+              pacingBase = lastTimestamp
+              pacingStart = performance.now()
+            }
+
+            const packets = packetizer.packetizeAccessUnit(unit.nals, lastTimestamp)
+
+            for (const packet of packets) {
+              rtpPackets += 1
+              rtpOctets += packet.length - RTP_HEADER_SIZE
+              session.videoSender.send(session.srtp.protect(packet))
+            }
+
+            session.metrics.markFirstPacket()
+            first = false
+          }
+        } finally {
+          await generation.dispose()
         }
 
-        session.metrics.markAccessUnit(unit.keyframe)
+        const next = session.control.pendingChannelId
 
-        const timestamp = toRtpTimestamp(unit.timestamp, source.track.timescale)
-
-        for (const packet of packetizer.packetizeAccessUnit(unit.nals, timestamp)) {
-          session.videoSender.send(session.srtp.protect(packet))
+        if ((next === null) || (next === channelId) || session.lifecycle.signal.aborted) {
+          return
         }
 
-        session.metrics.markFirstPacket()
+        // Leave a frame's gap so the new stream's first timestamp is strictly greater.
+        timestampOffset = lastTimestamp + 3000
+        pacingBase = null
+        pacingStart = null
+        channelId = next
+        this.#log.debug('Switching to channel %s.', channelId.toString())
       }
     } catch (error) {
       if (!isAbortError(error) && !session.lifecycle.signal.aborted) {
@@ -261,6 +430,24 @@ export class ProtectStreamingDelegate implements CameraStreamingDelegate {
       }
     } finally {
       await this.#stop(sessionId)
+    }
+  }
+
+  /**
+   * Send a sender report describing the stream so far, giving the receiver the
+   * RTP-to-wall-clock mapping its jitter buffer needs.
+   */
+  #sendReport(session: PreparedSession, rtpTimestamp: number, packetCount: number, octetCount: number): void {
+    if (session.lifecycle.signal.aborted || session.videoSender.closed || (packetCount === 0)) {
+      return
+    }
+
+    try {
+      const report = SrtcpSession.buildSenderReport({ octetCount, packetCount, rtpTimestamp, ssrc: session.ssrc })
+
+      session.videoSender.send(session.srtcp.protect(report))
+    } catch (error) {
+      this.#log.debug('Sender report failed: %s', error instanceof Error ? error.message : String(error))
     }
   }
 
