@@ -3,7 +3,7 @@ import type { API, PlatformAccessory, Service } from 'homebridge'
 import type { CameraCapabilities } from '../protect/capabilities.js'
 import type { CameraEvent } from '../protect/events.js'
 import type { ScopedLogger } from '../core/logger.js'
-import { conformingAlternatives, describeTier, hasConformingFrameRate } from '../protect/capabilities.js'
+import { conformingAlternatives, describeTier, hasConformingFrameRate, joinOr } from '../protect/capabilities.js'
 
 /**
  * How long a motion event stays asserted in HomeKit.
@@ -124,7 +124,7 @@ export class CameraAccessory {
       this.#log.warn('  %s channel runs at %s fps, which HomeKit does not negotiate (it accepts 15, 24 or 30).%s',
         tier.channelName, tier.fps.toString(),
         alternatives.length > 0
-          ? ` Set it to ${alternatives.join(' or ')} fps in Protect to use this tier.`
+          ? ` Set it to ${joinOr(alternatives)} fps in Protect to use this tier.`
           : ' This channel cannot be advertised.')
     }
   }
@@ -176,7 +176,12 @@ export class CameraAccessory {
         break
 
       case 'smartDetect':
-        this.#assertMotion(event.objectTypes.join(', ') || 'smart detection')
+        // Protect opens a smart detection before it has classified the object, so the
+        // first packet often carries an empty `objectTypes`. Motion is still real — we
+        // assert it and say the classification is pending rather than inventing one.
+        this.#assertMotion(event.objectTypes.length > 0
+          ? `smart detection: ${joinOr(event.objectTypes)}`
+          : 'smart detection (object not yet classified)')
         break
 
       case 'doorbellRing':

@@ -29,7 +29,16 @@ All notable changes to this project are documented here. The format follows
 - Frame-rate conformance reporting: a channel running at a rate HomeKit will not negotiate
   is reported, along with the conforming rates it could be set to, rather than advertised
   dishonestly.
-- `scripts/protect-probe.sh` for inspecting a controller's cameras.
+- `scripts/protect-probe.sh` for inspecting a controller's cameras, and
+  `scripts/dev-homebridge.sh` for running the plugin in an isolated Homebridge instance
+  with its own storage, bridge identity, PIN and port.
+
+### Fixed
+
+- Tier logging quoted Protect's channel *ceiling* while the probe quoted the *configured*
+  bitrate, so the two tools disagreed about the same camera. Both figures are now shown.
+- A smart detection whose object class Protect had not yet resolved was logged as though
+  the classification were known.
 
 ### Not yet implemented
 

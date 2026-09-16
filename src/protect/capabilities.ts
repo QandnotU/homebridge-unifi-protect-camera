@@ -165,12 +165,32 @@ export function readCapabilities(config: ProtectCameraConfig): CameraCapabilitie
   }
 }
 
-/** Format one tier for the log, e.g. `High 2688x1512@20fps ≤8.0 Mbps (rtsp)`. */
+/**
+ * Format one tier for the log, e.g. `High 2688x1512@20fps 8.0/10.0 Mbps (rtsp)`.
+ *
+ * Both bitrates are shown deliberately. Protect reports a *configured* bitrate and a
+ * higher channel *ceiling*, and quoting only one of them makes two tools disagree about
+ * the same camera. Phase 2's bitrate decisions need the configured figure (what the
+ * camera actually sends) while the ceiling bounds what it could be raised to.
+ */
 export function describeTier(tier: StreamTier): string {
-  const mbps = (tier.maxBitrate / 1e6).toFixed(1)
+  const configured = (tier.bitrate / 1e6).toFixed(1)
+  const ceiling = (tier.maxBitrate / 1e6).toFixed(1)
+  const rate = (configured === ceiling) ? `${configured} Mbps` : `${configured}/${ceiling} Mbps`
 
   return `${tier.channelName} ${tier.width.toString()}x${tier.height.toString()}@${tier.fps.toString()}fps ` +
-    `≤${mbps} Mbps${tier.rtspEnabled ? ' (rtsp)' : ''}${tier.enabled ? '' : ' [disabled]'}`
+    `${rate}${tier.rtspEnabled ? ' (rtsp)' : ''}${tier.enabled ? '' : ' [disabled]'}`
+}
+
+/** Join a list for prose: `30`, `30 or 24`, `30, 24 or 15`. */
+export function joinOr(values: readonly (number | string)[]): string {
+  const parts = values.map(String)
+
+  if (parts.length <= 1) {
+    return parts[0] ?? ''
+  }
+
+  return `${parts.slice(0, -1).join(', ')} or ${parts[parts.length - 1] ?? ''}`
 }
 
 /**

@@ -2,7 +2,7 @@ import type { ProtectCameraConfig } from 'unifi-protect'
 
 import { describe, expect, it } from 'vitest'
 
-import { conformingAlternatives, describeTier, hasConformingFrameRate, readCapabilities } from './capabilities.js'
+import { conformingAlternatives, describeTier, hasConformingFrameRate, joinOr, readCapabilities } from './capabilities.js'
 
 /** The frame-rate menu a G5 Bullet actually reports, on every channel. */
 const G5_FRAME_RATES = [1, 2, 3, 4, 5, 6, 8, 9, 10, 12, 15, 16, 18, 20, 24, 25, 30]
@@ -160,10 +160,21 @@ describe('frame-rate conformance', () => {
 })
 
 describe('describeTier', () => {
-  it('formats a tier for the log', () => {
+  it('collapses to one figure when configured and ceiling agree', () => {
     const high = readCapabilities(g5Bullet()).tiers[0]
 
-    expect(describeTier(high!)).toBe('High 2688x1512@20fps ≤8.0 Mbps (rtsp)')
+    expect(describeTier(high!)).toBe('High 2688x1512@20fps 8.0 Mbps (rtsp)')
+  })
+
+  it('shows configured and ceiling separately when they differ', () => {
+    // This is the real G5 Bullet case: 8 Mbps configured against a 10 Mbps channel
+    // ceiling. Quoting only one of them made the probe and the plugin disagree about the
+    // same camera.
+    const caps = readCapabilities(g5Bullet({
+      channels: [channel({ bitrate: 8_000_000, fps: 20, height: 1512, id: 0, maxBitrate: 10_000_000, name: 'High', width: 2688 })],
+    }))
+
+    expect(describeTier(caps.tiers[0]!)).toBe('High 2688x1512@20fps 8.0/10.0 Mbps (rtsp)')
   })
 
   it('marks a disabled channel', () => {
@@ -172,5 +183,17 @@ describe('describeTier', () => {
     }))
 
     expect(describeTier(caps.tiers[0]!)).toContain('[disabled]')
+  })
+})
+
+describe('joinOr', () => {
+  it('reads as prose rather than a repeated conjunction', () => {
+    expect(joinOr([30])).toBe('30')
+    expect(joinOr([30, 24])).toBe('30 or 24')
+    expect(joinOr([30, 24, 15])).toBe('30, 24 or 15')
+  })
+
+  it('handles an empty list', () => {
+    expect(joinOr([])).toBe('')
   })
 })

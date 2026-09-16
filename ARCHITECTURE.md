@@ -641,10 +641,10 @@ report identically:
 UVC G5 Bullet — firmware 5.4.132
   active codec  : h264
   supports      : h264, h265, mjpg     ← HEVC capable
-  channels:
-    High     2688×1512 @ 20fps   up to 8.0 Mbps   rtsp:on
-    Medium   1280× 720 @ 30fps   up to 2.0 Mbps   rtsp:on
-    Low       640× 360 @ 30fps   up to 0.4 Mbps   rtsp:on
+  channels:                     configured / channel ceiling
+    High     2688×1512 @ 20fps   8.0 / 10.0 Mbps   rtsp:on
+    Medium   1280× 720 @ 30fps   2.0 /  2.0 Mbps   rtsp:on
+    Low       640× 360 @ 30fps   0.4 /  1.0 Mbps   rtsp:on
   fps menu      : 30, 25, 24, 20, 18, 16, 15, 12, 10, 9, 8, 6, 5, 4, 3, 2, 1
                   (identical on all three channels — 24 and 30 are available on High)
   2560×1440     : not offered
@@ -653,6 +653,12 @@ UVC G5 Bullet — firmware 5.4.132
   audio codecs  : aac, opus
   smart detect  : person, vehicle, animal
 ```
+
+> **Two bitrates, not one.** Protect reports both a *configured* `bitrate` and a higher
+> `maxBitrate` channel ceiling. Quoting one without saying which makes two tools disagree
+> about the same camera — which is exactly what happened here between the probe and the
+> plugin. Phase 2's bitrate decisions need the configured figure (what the camera actually
+> sends); the ceiling only bounds what it could be raised to. `describeTier()` prints both.
 
 > **Probe caveat worth remembering.** `hasMic` exists *only* under `featureFlags`, while
 > `hasSpeaker` exists both there and at the top level. Reading `hasMic` from the top level
@@ -733,7 +739,7 @@ Apple classifies this as a **2K camera**. Measured against that profile:
 
 | Tier | Apple requires | G5 Bullet has | Verdict |
 |---|---|---|---|
-| High | 2560×1440 @ 24/30, ≤3000 kbps | 2688×1512 @ 20, ≤8000 kbps | resolution OK as "approximate"; **fps and bitrate out of spec** |
+| High | 2560×1440 @ 24/30, ≤3000 kbps | 2688×1512 @ 20, 8000 kbps (ceiling 10000) | resolution OK as "approximate"; **fps and bitrate out of spec** |
 | Medium | 1920×1080 @ 30, ≤1800 kbps | 1280×720 @ 30, ≤2000 kbps | **720p where 1080p is expected** |
 | Low | 640×360 @ 15 (or 240p @ 30), ≤190 kbps | 640×360 @ 30, ≤400 kbps | resolution exact; bitrate high |
 
