@@ -632,6 +632,87 @@ advertisable — but if it is rejected in testing, matching 2560×1440 exactly w
 either reconfiguring the Protect channel (check `channels[].width/height` for what the
 camera actually offers) or rescaling, which is a transcode.
 
+### 4.1 Measured capability — answered 2026-09-16
+
+Probed against the live controller (UDW "Dream Wall", Protect 7.2.105). Both cameras
+report identically:
+
+```
+UVC G5 Bullet
+  active codec  : h264
+  supports      : h264, h265, mjpg     ← HEVC capable
+  channels:
+    High     2688×1512 @ 20fps   up to 8.0 Mbps   rtsp:on
+    Medium   1280× 720 @ 30fps   up to 2.0 Mbps   rtsp:on
+    Low       640× 360 @ 30fps   up to 0.4 Mbps   rtsp:on
+  fps menu      : 30, 25, 24, 20, 18, 16, 15, 12, 10, 9, 8, 6, 5, 4, 3, 2, 1
+  2560×1440     : not offered
+```
+
+**The decision tree resolves to the YES branch — but the timing matters, and the answer
+is "not yet".**
+
+HEVC being available does not mean switching to it now. The classic `CameraController`
+path is H.264-only (`VideoCodecType.H265` is a commented-out enum member), so flipping
+Protect to Enhanced encoding today would force a transcode on *every* stream, violating
+passthrough-first in exchange for a benefit that does not exist until HAP-NodeJS gains
+HKSV3 support. **Stay on H.264. Revisit the moment PR #1132 lands.**
+
+#### What passthrough gets us today
+
+This is better than expected. Apple Home's two commonly-observed requests both map to a
+native channel with RTSP already enabled:
+
+| HomeKit asks for | Native channel | Action |
+|---|---|---|
+| 1280×720 | **Medium**, 1280×720 H.264 | direct passthrough |
+| 640×360 | **Low**, 640×360 H.264 | direct passthrough |
+
+Both are exact matches, so Phase 2 should reach `Mode: Direct H.264 Passthrough` on the
+common case immediately — no resolution compromise, no FFmpeg.
+
+One caveat for the stream selector: Medium is capped at 2.0 Mbps while HomeKit typically
+requests ~299 Kbps. Passing through a stream that overshoots the negotiated
+`max_bit_rate` is a protocol problem, not a quality win. Protect exposes per-channel
+bitrate, so the options are (a) lower the Medium channel's cap once, (b) adjust it
+dynamically per session — which affects every other consumer of that channel, so
+probably not — or (c) accept the overshoot on local networks and log it. Decide in
+Phase 2 with real measurements.
+
+#### The 20 fps problem
+
+HomeKit expects 15, 24 or 30 fps; the High channel is at **20**. `homebridge-unifi-protect`
+works around this by advertising a normalised rate and delivering the real one
+(`buildAdvertisedProfiles` maps 20 → 24). That is a lie to the controller, and we should
+not repeat it: the camera's fps menu includes both 24 and 30, so **set the High channel
+to 24 fps** and let the advertisement be true. Confirm the High channel specifically
+offers 24 fps — `fpsValues` is per-channel and the figure above is aggregated across all
+three.
+
+#### Gaps against Apple's HKSV3 tier profile (for later)
+
+Apple classifies this as a **2K camera**. Measured against that profile:
+
+| Tier | Apple requires | G5 Bullet has | Verdict |
+|---|---|---|---|
+| High | 2560×1440 @ 24/30, ≤3000 kbps | 2688×1512 @ 20, ≤8000 kbps | resolution OK as "approximate"; **fps and bitrate out of spec** |
+| Medium | 1920×1080 @ 30, ≤1800 kbps | 1280×720 @ 30, ≤2000 kbps | **720p where 1080p is expected** |
+| Low | 640×360 @ 15 (or 240p @ 30), ≤190 kbps | 640×360 @ 30, ≤400 kbps | resolution exact; bitrate high |
+
+Three things to note:
+
+1. **No 2560×1440 channel exists**, and Protect's channel set is fixed per camera model —
+   there is no resolution picker. So 2688×1512 must be advertised as the approximate
+   High tier (spec §4.3 explicitly permits this) or rescaled, which is a transcode.
+2. **Medium at 720p is the one structural gap.** The G5 Bullet's Medium/Low pair exactly
+   matches Apple's *1080p-camera* profile, not its 2K profile. Either advertise 720p as
+   Medium and see whether the hub accepts it, or synthesise a 1080p Medium by transcoding
+   from High — which costs the passthrough property on that tier.
+3. **Bitrates are well above Apple's targets**, but Apple's numbers assume HEVC. 2688×1512
+   HEVC at ~3 Mbps is roughly quality-equivalent to today's 8 Mbps H.264, so conforming
+   is close to free *once we are on HEVC anyway*. Do not lower it while still on H.264.
+
+
 ---
 
 ## 5. Recommended architecture
@@ -888,24 +969,13 @@ there is only one implementation. It is the seam that makes a future
 
 ## 8. Open questions — verify before designing further
 
-### 8.1 Do the G5 Bullets support H.265? ★ highest value
+### 8.1 Do the G5 Bullets support H.265? — ANSWERED
 
-Everything in §4 turns on this. Check `featureFlags.videoCodecs` on the camera:
+**Yes.** Both report `videoCodecs: [h264, h265, mjpg]`. Full measurements, the resulting
+decision and the gaps against Apple's tier profile are in **§4.1**.
 
-```bash
-curl -sk -c /tmp/uc -X POST "https://<NVR>/api/auth/login" \
-  -H 'Content-Type: application/json' \
-  -d '{"username":"<local-user>","password":"<password>"}' >/dev/null
-curl -sk -b /tmp/uc "https://<NVR>/proxy/protect/api/bootstrap" \
-  | node -e 'let d="";process.stdin.on("data",c=>d+=c).on("end",()=>{
-      JSON.parse(d).cameras.forEach(c=>console.log(
-        c.name, "|", c.type, "| active:", c.videoCodec,
-        "| supports:", (c.featureFlags?.videoCodecs||[]).join(","),
-        "| channels:", (c.channels||[]).map(x=>`${x.name} ${x.width}x${x.height}@${x.fps} ${Math.round(x.bitrate/1000)}k`).join(" / ")))})'
-```
-
-This also answers: what are the **exact** High/Medium/Low dimensions, frame rates and
-bitrates, and does any channel offer 2560×1440?
+Reusable probe (prompts for the password; never places it in argv, shell history or on
+disk): `scripts/protect-probe.sh`.
 
 ### 8.2 Will iOS request >1080p on the classic path if offered an out-of-spec level?
 
