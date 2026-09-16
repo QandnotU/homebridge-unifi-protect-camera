@@ -1,0 +1,68 @@
+{
+  "name": "homebridge-unifi-protect-camera",
+  "displayName": "UniFi Protect Camera",
+  "version": "0.1.0",
+  "type": "module",
+  "description": "A modern, passthrough-first Homebridge plugin bringing UniFi Protect cameras to Apple Home and HomeKit Secure Video.",
+  "license": "Apache-2.0",
+  "author": "QandnotU",
+  "homepage": "https://github.com/QandnotU/homebridge-unifi-protect-camera#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/QandnotU/homebridge-unifi-protect-camera.git"
+  },
+  "bugs": {
+    "url": "https://github.com/QandnotU/homebridge-unifi-protect-camera/issues"
+  },
+  "keywords": [
+    "homebridge-plugin",
+    "supports-hap",
+    "homebridge",
+    "homekit",
+    "hksv",
+    "homekit-secure-video",
+    "unifi",
+    "unifi-protect",
+    "ubiquiti",
+    "camera"
+  ],
+  "main": "dist/index.js",
+  "exports": "./dist/index.js",
+  "types": "dist/index.d.ts",
+  "files": [
+    "ARCHITECTURE.md",
+    "CHANGELOG.md",
+    "LICENSE",
+    "README.md",
+    "config.schema.json",
+    "dist"
+  ],
+  "engines": {
+    "node": "^22.20.0 || ^24.0.0 || ^26.0.0",
+    "homebridge": "^2.0.0"
+  },
+  "scripts": {
+    "build": "rimraf dist && tsc -p tsconfig.build.json",
+    "watch": "tsc -p tsconfig.build.json --watch",
+    "typecheck": "tsc --noEmit",
+    "lint": "eslint . --max-warnings=0",
+    "lint:fix": "eslint . --fix",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "check": "npm run lint && npm run typecheck && npm run test",
+    "prepublishOnly": "npm run check && npm run build"
+  },
+  "dependencies": {
+    "unifi-protect": "5.3.1"
+  },
+  "devDependencies": {
+    "@eslint/js": "^10.0.1",
+    "@types/node": "^24.13.5",
+    "eslint": "^10.10.0",
+    "homebridge": "^2.4.0",
+    "rimraf": "^6.1.3",
+    "typescript": "^6.0.3",
+    "typescript-eslint": "^8.70.0",
+    "vitest": "^5.0.1"
+  }
+}

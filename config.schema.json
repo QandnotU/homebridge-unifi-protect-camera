@@ -1,0 +1,101 @@
+{
+  "pluginAlias": "UniFiProtectCamera",
+  "pluginType": "platform",
+  "singular": true,
+  "headerDisplay": "Brings UniFi Protect cameras to Apple Home and HomeKit Secure Video, preferring direct stream passthrough over transcoding.\n\nUse a **dedicated local Protect user** — not a Ubiquiti cloud account. The plugin never contacts Ubiquiti's cloud.",
+  "footerDisplay": "See the [README](https://github.com/QandnotU/homebridge-unifi-protect-camera#readme) for setup, and ARCHITECTURE.md for design notes.",
+  "schema": {
+    "type": "object",
+    "properties": {
+      "name": {
+        "title": "Name",
+        "type": "string",
+        "default": "UniFi Protect Camera",
+        "description": "Name shown in the Homebridge log."
+      },
+      "controllers": {
+        "title": "Protect Controllers",
+        "type": "array",
+        "minItems": 1,
+        "items": {
+          "type": "object",
+          "properties": {
+            "name": {
+              "title": "Name",
+              "type": "string",
+              "placeholder": "Home NVR",
+              "description": "Optional label used in logs. Defaults to the host address."
+            },
+            "host": {
+              "title": "Host",
+              "type": "string",
+              "required": true,
+              "placeholder": "192.168.1.1",
+              "format": "hostname",
+              "description": "Hostname or IP address of the Protect controller on your local network."
+            },
+            "username": {
+              "title": "Username",
+              "type": "string",
+              "required": true,
+              "description": "A dedicated local Protect user with camera access."
+            },
+            "password": {
+              "title": "Password",
+              "type": "string",
+              "required": true,
+              "x-schema-form": { "type": "password" }
+            },
+            "verifyTls": {
+              "title": "Verify TLS certificate",
+              "type": "boolean",
+              "default": false,
+              "description": "Leave off unless you have installed your own certificate. Protect controllers use a self-signed certificate by default."
+            }
+          }
+        }
+      },
+      "options": {
+        "title": "Options",
+        "type": "object",
+        "properties": {
+          "maximumQuality": {
+            "title": "Maximum HomeKit Quality",
+            "type": "boolean",
+            "default": false,
+            "description": "Always prefer the highest-quality compatible Protect stream and never step down to save bandwidth. Prioritises image quality over CPU and network cost."
+          },
+          "verboseDiagnostics": {
+            "title": "Verbose streaming diagnostics",
+            "type": "boolean",
+            "default": false,
+            "description": "Log the full per-session record (negotiation, chosen source, delivery mode, timings) instead of a one-line summary."
+          }
+        }
+      }
+    }
+  },
+  "layout": [
+    { "key": "name" },
+    {
+      "key": "controllers",
+      "type": "array",
+      "title": "Protect Controllers",
+      "buttonText": "Add Controller",
+      "items": [
+        "controllers[].name",
+        "controllers[].host",
+        "controllers[].username",
+        "controllers[].password",
+        "controllers[].verifyTls"
+      ]
+    },
+    {
+      "type": "fieldset",
+      "title": "Options",
+      "expandable": true,
+      "expanded": false,
+      "items": ["options.maximumQuality", "options.verboseDiagnostics"]
+    }
+  ]
+}
