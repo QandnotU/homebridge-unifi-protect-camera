@@ -16,6 +16,22 @@ All notable changes to this project are documented here. The format follows
 - Dynamic platform skeleton with configuration validation, scoped logging, cached
   accessory tracking and `AbortController`-based shutdown.
 
+- Phase 1 — Protect discovery. Connects to each configured controller with
+  `ProtectClient.connect()`, distinguishing fatal failures (bad credentials, missing
+  permission) from recoverable ones, which retry with exponential backoff to a five-minute
+  ceiling. Cameras are discovered, reconciled against Homebridge's cached accessories and
+  exposed with identity and a motion sensor. Realtime Protect events drive motion; smart
+  detections (person, vehicle, animal) drive it too. Controller reachability is reflected
+  through `StatusActive`.
+- Capability model (`readCapabilities`) deriving quality tiers, codec support, audio
+  capability and smart-detect types from a camera's Protect configuration. This is the
+  abstraction the HomeKit renderer and stream selector both build on.
+- Frame-rate conformance reporting: a channel running at a rate HomeKit will not negotiate
+  is reported, along with the conforming rates it could be set to, rather than advertised
+  dishonestly.
+- `scripts/protect-probe.sh` for inspecting a controller's cameras.
+
 ### Not yet implemented
 
-- Protect connectivity, camera discovery, video, snapshots and HomeKit Secure Video.
+- Video, snapshots and HomeKit Secure Video.
+- Doorbells, two-way audio, floodlights and chimes.

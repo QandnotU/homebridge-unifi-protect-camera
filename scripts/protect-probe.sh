@@ -76,7 +76,14 @@ for (const c of cameras) {
   }
   console.log(`  has 2560x1440  : ${channels.some(ch => ch.width === 2560 && ch.height === 1440) ? "yes" : "no"}`)
   const ff = c.featureFlags ?? {}
-  console.log(`  audio          : mic ${c.hasMic ? "yes" : "no"}, speaker ${c.hasSpeaker ? "yes" : "no"}, codecs ${(ff.audioCodecs ?? []).join(", ") || "?"}`)
+  // hasMic exists ONLY under featureFlags; hasSpeaker exists in both places. Print the raw
+  // values so a flag that is simply absent is never reported as a definite "no".
+  const show = v => (v === undefined ? "ABSENT" : String(v))
+  console.log(`  mic            : featureFlags.hasMic=${show(ff.hasMic)}`)
+  console.log(`  speaker        : featureFlags.hasSpeaker=${show(ff.hasSpeaker)}, camera.hasSpeaker=${show(c.hasSpeaker)}`)
+  console.log(`  audio codecs   : ${(ff.audioCodecs ?? []).join(", ") || "(none)"}`)
+  const tb = c.talkbackSettings
+  console.log(`  talkback       : ${tb ? `${tb.typeFmt ?? "?"} ${tb.samplingRate ?? "?"}Hz ch${tb.channels ?? "?"} port ${tb.bindPort ?? "?"}` : "(none)"}`)
   console.log(`  smart detect   : ${(ff.smartDetectTypes ?? []).join(", ") || "(none)"}`)
   console.log(`  firmware       : ${c.firmwareVersion ?? "?"}`)
 }

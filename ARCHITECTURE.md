@@ -638,7 +638,7 @@ Probed against the live controller (UDW "Dream Wall", Protect 7.2.105). Both cam
 report identically:
 
 ```
-UVC G5 Bullet
+UVC G5 Bullet — firmware 5.4.132
   active codec  : h264
   supports      : h264, h265, mjpg     ← HEVC capable
   channels:
@@ -646,8 +646,41 @@ UVC G5 Bullet
     Medium   1280× 720 @ 30fps   up to 2.0 Mbps   rtsp:on
     Low       640× 360 @ 30fps   up to 0.4 Mbps   rtsp:on
   fps menu      : 30, 25, 24, 20, 18, 16, 15, 12, 10, 9, 8, 6, 5, 4, 3, 2, 1
+                  (identical on all three channels — 24 and 30 are available on High)
   2560×1440     : not offered
+  mic           : yes   (featureFlags.hasMic)
+  speaker       : no    (false at both featureFlags.hasSpeaker and camera.hasSpeaker)
+  audio codecs  : aac, opus
+  smart detect  : person, vehicle, animal
 ```
+
+> **Probe caveat worth remembering.** `hasMic` exists *only* under `featureFlags`, while
+> `hasSpeaker` exists both there and at the top level. Reading `hasMic` from the top level
+> yields `undefined`, which is falsy — so a naive probe reports "no microphone" for a
+> camera that has one. `scripts/protect-probe.sh` now prints the raw value and `ABSENT`
+> rather than coercing to yes/no, and `readCapabilities()` reads each flag from where it
+> actually lives.
+
+#### Audio
+
+**Microphone yes, speaker no.** That splits cleanly across the phases:
+
+- **Phase 2/4 (live audio, HKSV audio): viable.** The camera captures audio and Protect
+  offers both `aac` and `opus`.
+- **Phase 7 (two-way audio): not on these cameras.** There is no speaker, so there is
+  nothing to talk back through. Protect still reports a `talkbackSettings` block
+  (`aac 22050 Hz, mono, port 7004`), but that is a default, not evidence of hardware —
+  do not treat its presence as a capability signal.
+
+The `opus` availability is a quiet win for the HKSV3 path: Apple's iOS 27 spec makes Opus
+**mandatory** for secure video, 16 kHz capture, reported as 48 kHz. The camera can already
+produce it, so that requirement costs us nothing when the time comes.
+
+#### Smart detections
+
+`person`, `vehicle`, `animal`. No `package`, `face` or `licensePlate` — expected, since
+these are bullets rather than doorbells. Phase 3 maps exactly these three and must not
+assume the others exist.
 
 **The decision tree resolves to the YES branch — but the timing matters, and the answer
 is "not yet".**
@@ -679,15 +712,20 @@ dynamically per session — which affects every other consumer of that channel, 
 probably not — or (c) accept the overshoot on local networks and log it. Decide in
 Phase 2 with real measurements.
 
-#### The 20 fps problem
+#### The 20 fps problem — resolved
 
-HomeKit expects 15, 24 or 30 fps; the High channel is at **20**. `homebridge-unifi-protect`
-works around this by advertising a normalised rate and delivering the real one
-(`buildAdvertisedProfiles` maps 20 → 24). That is a lie to the controller, and we should
-not repeat it: the camera's fps menu includes both 24 and 30, so **set the High channel
-to 24 fps** and let the advertisement be true. Confirm the High channel specifically
-offers 24 fps — `fpsValues` is per-channel and the figure above is aggregated across all
-three.
+HomeKit expects 15, 24 or 30 fps; the High channel ships at **20**.
+`homebridge-unifi-protect` works around this by advertising a normalised rate and
+delivering the real one (`buildAdvertisedProfiles` maps 20 → 24). That is a lie to the
+controller and we do not repeat it.
+
+Per-channel `fpsValues` confirms **24 and 30 are both available on the High channel**, so
+the honest fix is a one-line Protect change: **set High to 24 fps** (matching Apple's
+"2K at 24 or 30fps" requirement) and advertise what we actually send.
+
+Until that change is made, `hasConformingFrameRate()` flags the mismatch and
+`conformingAlternatives()` reports what the channel could be set to, so the plugin
+surfaces the problem instead of hiding it.
 
 #### Gaps against Apple's HKSV3 tier profile (for later)
 
