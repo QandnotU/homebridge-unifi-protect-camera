@@ -235,3 +235,58 @@ export function readVideoTrackId(initSegment: Buffer): number | null {
 
   return null
 }
+
+/**
+ * The `tfdt` base media decode time for one track, in the track's own timescale.
+ *
+ * This is the authoritative stream timeline. The `unifi-protect` session negotiates
+ * `rebaseTimestampsToZero`, so it starts near zero and advances continuously for the life
+ * of the connection — restarting only across a reconnect, which the library flags on the
+ * segment as `discontinuity`.
+ *
+ * It is worth reading rather than inferring. The per-frame `timestamps` array describes
+ * spacing *within* a segment correctly, but reconstructing a stream clock from it means
+ * re-estimating the frame interval every fragment and accumulating whatever that estimate
+ * gets wrong. `tfdt` states the answer outright.
+ *
+ * Returns null when the segment carries no `tfdt` for that track, which is legal — the box
+ * is optional — so callers must be able to proceed without it.
+ */
+export function readBaseMediaDecodeTime(moof: Buffer, trackId: number): number | null {
+  for (const box of iterateBoxes(moof)) {
+    if (box.type !== 'moof') {
+      continue
+    }
+
+    for (const traf of childrenOf(box)) {
+      if (traf.type !== 'traf') {
+        continue
+      }
+
+      let matched = false
+      let decodeTime: number | null = null
+
+      for (const child of childrenOf(traf)) {
+        if (child.type === 'tfhd') {
+          matched = (parseTfhd(child.body)?.trackId === trackId)
+        }
+
+        if ((child.type === 'tfdt') && (child.body.length >= 8)) {
+          const version = child.body.readUInt8(0)
+
+          // Version 1 widens the field to 64 bits. Rebasing to zero keeps it inside the
+          // safe-integer range, so a Number is exact here.
+          decodeTime = (version === 1)
+            ? ((child.body.length >= 12) ? Number(child.body.readBigUInt64BE(4)) : null)
+            : child.body.readUInt32BE(4)
+        }
+      }
+
+      if (matched && (decodeTime !== null)) {
+        return decodeTime
+      }
+    }
+  }
+
+  return null
+}

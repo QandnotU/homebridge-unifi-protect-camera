@@ -7,7 +7,7 @@ import type { TrackInfo } from '../fmp4/init-segment.js'
 import { applyTimestamps, splitAccessUnits, withParameterSets } from '../fmp4/demux.js'
 import { readAvcConfig } from '../fmp4/avcc.js'
 import { iterateBoxes } from '../fmp4/boxes.js'
-import { parseMoof, readVideoTrackId } from '../fmp4/moof.js'
+import { parseMoof, readBaseMediaDecodeTime, readVideoTrackId } from '../fmp4/moof.js'
 import { readTrackInfo } from '../fmp4/init-segment.js'
 
 /**
@@ -26,7 +26,7 @@ import { readTrackInfo } from '../fmp4/init-segment.js'
  * `trun`, which is the only thing that actually knows where video ends.
  */
 export function videoTrack(segment: { data?: Buffer, moof?: Buffer }, videoTrackId: number | null):
-  { payload: Buffer, compositionOffsets: readonly number[] } | null {
+  { payload: Buffer, compositionOffsets: readonly number[], sampleCount: number } | null {
   const data = segment.data
 
   if (!data) {
@@ -44,7 +44,7 @@ export function videoTrack(segment: { data?: Buffer, moof?: Buffer }, videoTrack
       const end = start + video.totalBytes
 
       if ((start >= 0) && (end <= data.length)) {
-        return { compositionOffsets: video.compositionOffsets, payload: data.subarray(start, end) }
+        return { compositionOffsets: video.compositionOffsets, payload: data.subarray(start, end), sampleCount: video.sampleCount }
       }
     }
   }
@@ -54,7 +54,7 @@ export function videoTrack(segment: { data?: Buffer, moof?: Buffer }, videoTrack
   // mismatch described above. A degraded stream beats no stream.
   for (const box of iterateBoxes(data)) {
     if (box.type === 'mdat') {
-      return { compositionOffsets: [], payload: box.body }
+      return { compositionOffsets: [], payload: box.body, sampleCount: 0 }
     }
   }
 
@@ -83,7 +83,7 @@ export interface VideoSourceOptions {
 export class VideoSource {
   readonly #config: AvcConfig
   readonly #track: TrackInfo
-  readonly #subscription: AsyncIterable<{ type: string, data?: Buffer, mdat?: Buffer, moof?: Buffer, timestamps?: number[] }>
+  readonly #subscription: AsyncIterable<{ type: string, data?: Buffer, mdat?: Buffer, moof?: Buffer, timestamps?: number[], discontinuity?: true }>
     & { stats?: { delivered: number, discarded: number, peakQueueDepth: number, queueDepth: number } }
   readonly #log: ScopedLogger
   readonly #fps: number
@@ -92,10 +92,21 @@ export class VideoSource {
   #mismatches = 0
   #sawComposition = false
 
+  // Measurement only: how far our synthesised clock has drifted from the stream's own
+  // tfdt timeline. Nothing acts on these — they exist to decide whether the timeline is
+  // where the jitter comes from before any of the timing code is rewritten around it.
+  #tfdtBase: number | null = null
+  #clockBase = 0
+  #driftNow = 0
+  #driftPeak = 0
+  #driftSamples = 0
+  #discontinuities = 0
+  #trunDisagreements = 0
+
   private constructor(
     config: AvcConfig,
     track: TrackInfo,
-    subscription: AsyncIterable<{ type: string, data?: Buffer, mdat?: Buffer, moof?: Buffer, timestamps?: number[] }>
+    subscription: AsyncIterable<{ type: string, data?: Buffer, mdat?: Buffer, moof?: Buffer, timestamps?: number[], discontinuity?: true }>
       & { stats?: { delivered: number, discarded: number, peakQueueDepth: number, queueDepth: number } },
     log: ScopedLogger,
     fps: number,
@@ -183,6 +194,28 @@ export class VideoSource {
   }
 
   /**
+   * Drift between our synthesised clock and the stream's tfdt timeline, in ticks.
+   *
+   * Zero means reconstructing the clock from per-segment spacing agrees with what the
+   * controller actually stamped, and the timeline is not the source of our jitter. A
+   * figure that grows with time means it is.
+   */
+  get timeline(): {
+    driftNow: number, driftPeak: number, samples: number, discontinuities: number,
+    anchored: boolean, mismatches: number, trunDisagreements: number,
+    } {
+    return {
+      anchored: this.#tfdtBase !== null,
+      discontinuities: this.#discontinuities,
+      driftNow: this.#driftNow,
+      driftPeak: this.#driftPeak,
+      mismatches: this.#mismatches,
+      samples: this.#driftSamples,
+      trunDisagreements: this.#trunDisagreements,
+    }
+  }
+
+  /**
    * Yield access units on a continuous, strictly increasing timeline.
    *
    * Protect's decode timestamps are **segment-relative**, not a stream clock. Measured
@@ -207,10 +240,18 @@ export class VideoSource {
    * and PPS in the init segment and a client joining mid-stream never saw it.
    */
   async *accessUnits(): AsyncGenerator<AccessUnit> {
-    // One frame's worth of ticks: the gap left between segments, and the fallback spacing
-    // when the controller sends no timestamps at all.
-    const step = Math.max(1, Math.round(this.#track.timescale / Math.max(1, this.#fps)))
+    // The nominal frame interval, used only until the controller's own timestamps reveal
+    // the real one.
+    //
+    // The configured frame rate is not the delivered frame rate. A channel set to 30 fps
+    // was measured delivering closer to 25, and pacing to the nominal figure makes our
+    // media clock run ~20% fast: the sender waits longer and longer for frames that are
+    // already late, until it is far enough behind to resync. Measured against a live
+    // client that produced 771 ms of interarrival jitter with zero packet loss — the
+    // stream was never losing anything, it was arriving at wildly uneven intervals.
+    const nominalStep = Math.max(1, Math.round(this.#track.timescale / Math.max(1, this.#fps)))
 
+    let step = nominalStep
     let clock = 0
 
     for await (const segment of this.#subscription) {
@@ -222,6 +263,30 @@ export class VideoSource {
 
       if (!track) {
         continue
+      }
+
+      if (segment.discontinuity) {
+        // The controller reconnected and restarted its timeline near zero. Re-anchor the
+        // comparison rather than reporting the jump as drift.
+        this.#discontinuities += 1
+        this.#tfdtBase = null
+      }
+
+      const tfdt = ((this.#videoTrackId !== null) && segment.data)
+        ? readBaseMediaDecodeTime(segment.data, this.#videoTrackId)
+        : null
+
+      if (tfdt !== null) {
+        if (this.#tfdtBase === null) {
+          this.#tfdtBase = tfdt
+          this.#clockBase = clock
+        } else {
+          // How far the synthesised clock would have drifted by now. Kept as a measurement
+          // of what anchoring removes, not as an input to anything.
+          this.#driftNow = (clock - this.#clockBase) - (tfdt - this.#tfdtBase)
+          this.#driftPeak = Math.max(this.#driftPeak, Math.abs(this.#driftNow))
+          this.#driftSamples += 1
+        }
       }
 
       const units = splitAccessUnits(track.payload, this.#config)
@@ -244,8 +309,29 @@ export class VideoSource {
         }
       }
 
+      // The sample table states how many pictures the fragment holds. When the splitter
+      // disagrees, one of the two is wrong and this segment's timing is a guess.
+      if ((track.sampleCount > 0) && (units.length !== track.sampleCount)) {
+        this.#trunDisagreements += 1
+      }
+
       const timed = applyTimestamps(units, segment.timestamps, 0, step)
       const first = timed[0]?.timestamp ?? 0
+
+      // Anchor the segment to the controller's own timeline.
+      //
+      // Reconstructing a stream clock from per-segment spacing means re-estimating the
+      // frame interval every fragment and keeping whatever each estimate got wrong. Measured
+      // against a live camera that accumulated -397 ms over 43 seconds — a clock running
+      // 0.92% slow, without bound, while the pictures themselves were fine.
+      //
+      // `tfdt` states the answer instead of inferring it: the session negotiates
+      // rebaseTimestampsToZero, so it starts near zero and advances continuously, restarting
+      // only across a reconnect that the library flags as `discontinuity`. Anchoring here
+      // makes a bad per-segment estimate cost that segment alone rather than the session.
+      const anchor = ((tfdt !== null) && (this.#tfdtBase !== null))
+        ? (this.#clockBase + (tfdt - this.#tfdtBase))
+        : clock
 
       for (const [index, unit] of timed.entries()) {
         // Guard against a non-monotonic segment: never emit a timestamp below the clock.
@@ -261,10 +347,23 @@ export class VideoSource {
           this.#log.info('Stream uses B-frames; applying composition time offsets.')
         }
 
-        yield withParameterSets({ ...unit, timestamp: clock + offset + composition }, this.#config)
+        yield withParameterSets({ ...unit, timestamp: anchor + offset + composition }, this.#config)
       }
 
       const span = Math.max(0, (timed.at(-1)?.timestamp ?? first) - first)
+
+      // Learn the real frame interval from the spacing within this segment, so the gap we
+      // leave between segments matches what the camera actually delivers.
+      if (timed.length >= 2) {
+        const measured = Math.round(span / (timed.length - 1))
+
+        // Ignore implausible values: a segment whose timestamps are damaged should not be
+        // allowed to drag the clock off the rails.
+        if ((measured > (nominalStep / 4)) && (measured < (nominalStep * 4))) {
+          // Smooth, so one odd segment moves the estimate a little rather than a lot.
+          step = Math.round((step * 3 + measured) / 4)
+        }
+      }
 
       clock += span + step
     }

@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
 
-import { parseMoof, readVideoTrackId } from './moof.js'
+import { parseMoof, readBaseMediaDecodeTime, readVideoTrackId } from './moof.js'
 
 function box(type: string, body: Uint8Array): Buffer {
   const header = Buffer.alloc(8)
@@ -173,5 +173,52 @@ describe('composition time offsets', () => {
     const moof = box('moof', box('traf', Buffer.concat([tfhd(1), trun(248, [100, 200])])))
 
     expect(parseMoof(moof)[0]?.compositionOffsets).toEqual([])
+  })
+})
+
+describe('readBaseMediaDecodeTime', () => {
+  // tfhd needs flags with neither base-data-offset nor default-sample-size set, so the
+  // parser reads the track id and stops.
+  function tfhd(trackId: number): Buffer {
+    return box('tfhd', u32(0, trackId))
+  }
+
+  function traf(trackId: number, tfdt: Buffer): Buffer {
+    return box('traf', Buffer.concat([tfhd(trackId), tfdt]))
+  }
+
+  it('reads a 32-bit base media decode time', () => {
+    const tfdt = box('tfdt', u32(0, 1_234_567))
+    const moof = box('moof', traf(1, tfdt))
+
+    expect(readBaseMediaDecodeTime(moof, 1)).toBe(1_234_567)
+  })
+
+  it('reads a 64-bit base media decode time', () => {
+    const body = Buffer.alloc(12)
+
+    body.writeUInt8(1, 0)
+    body.writeBigUInt64BE(9_007_199_254n, 4)
+
+    const moof = box('moof', traf(2, box('tfdt', body)))
+
+    expect(readBaseMediaDecodeTime(moof, 2)).toBe(9_007_199_254)
+  })
+
+  it('returns the requested track, not the first one', () => {
+    // Protect puts audio and video in one fragment, and not in the order a reader expects.
+    const audio = traf(1, box('tfdt', u32(0, 500)))
+    const video = traf(2, box('tfdt', u32(0, 9000)))
+    const moof = box('moof', Buffer.concat([audio, video]))
+
+    expect(readBaseMediaDecodeTime(moof, 2)).toBe(9000)
+    expect(readBaseMediaDecodeTime(moof, 1)).toBe(500)
+  })
+
+  it('returns null when the track has no tfdt, rather than guessing', () => {
+    const moof = box('moof', box('traf', tfhd(1)))
+
+    expect(readBaseMediaDecodeTime(moof, 1)).toBeNull()
+    expect(readBaseMediaDecodeTime(moof, 99)).toBeNull()
   })
 })
