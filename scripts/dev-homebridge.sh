@@ -143,11 +143,26 @@ if [ -n "$STALE" ]; then
   esac
 fi
 
+LOG="$DEV_DIR/homebridge.log"
+
 echo "Pairing PIN: $(node -e 'console.log(JSON.parse(require("fs").readFileSync(process.argv[1],"utf8")).bridge.pin)' "$CONFIG")"
 echo "Storage    : $DEV_DIR"
+echo "Log        : $LOG"
+# Stamp the build being loaded. Node reads dist once at startup, so an instance left
+# running through a rebuild silently serves the old code - which has already cost several
+# test cycles chasing numbers from a build that was no longer the one on disk.
+echo "Build      : $(date -r "$HERE/dist/homekit/streaming-delegate.js" '+%l:%M:%S %p' | sed 's/^ *//')"
 echo "Ctrl-C to stop."
 echo
 
+# Keep a copy of the run on disk as well as on the terminal. Diagnosing a streaming session
+# means reading numbers printed when it ends, and scrollback is a poor place to keep them:
+# every measurement so far has had to be copied out of a terminal by hand.
+#
 # -K keeps cached accessories when the plugin fails to load. Without it a build error or a
 # wrong Node version unregisters every paired camera, losing its room and automations.
-exec "$NODE_BIN" "$HERE/node_modules/homebridge/bin/homebridge.js" -D -K -U "$DEV_DIR" -P "$HERE" --strict-plugin-resolution
+#
+# The pipeline would otherwise report tee's exit status, so failures here stay visible.
+set -o pipefail
+
+"$NODE_BIN" "$HERE/node_modules/homebridge/bin/homebridge.js" -D -K -U "$DEV_DIR" -P "$HERE" --strict-plugin-resolution 2>&1 | tee "$LOG"

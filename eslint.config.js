@@ -2,7 +2,8 @@ import eslint from '@eslint/js'
 import tseslint from 'typescript-eslint'
 
 export default tseslint.config(
-  { ignores: ['dist/**', 'coverage/**', 'node_modules/**'] },
+  // scripts/ holds standalone diagnostic tools run against dist/, not part of the TS project.
+  { ignores: ['dist/**', 'coverage/**', 'node_modules/**', 'scripts/**'] },
   eslint.configs.recommended,
   ...tseslint.configs.recommendedTypeChecked,
   {
