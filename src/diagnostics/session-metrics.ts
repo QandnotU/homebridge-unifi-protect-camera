@@ -1,4 +1,5 @@
 import type { DeliveryMode, StreamSelection } from '../media/select/stream-selector.js'
+import type { ReceiverReport } from '../media/rtp/srtcp.js'
 import type { SenderStats } from '../media/rtp/sender.js'
 import { describeMode, formatBitrate, isTranscoding } from '../media/select/stream-selector.js'
 import { formatHapLevel, formatHapProfile } from '../homekit/hap-constants.js'
@@ -38,6 +39,17 @@ export class SessionMetrics {
   #accessUnits = 0
   #keyframes = 0
   #reconfigurations: { at: number, height: number, maxBitrate: number, width: number }[] = []
+  #reports = 0
+  #worstFractionLost = 0
+  #lastCumulativeLost = 0
+  #peakJitter = 0
+  #lastJitter = 0
+  #sendSkewTotal = 0
+  #sendSkewCount = 0
+  #sendSkewMax = 0
+  #sendSkewSpikes = 0
+  #previousSendAt = 0
+  #previousStamp = 0
 
   constructor(sessionId: string) {
     this.#sessionId = sessionId
@@ -65,6 +77,42 @@ export class SessionMetrics {
     this.#firstPacketAt ??= Date.now()
   }
 
+  /**
+   * Record how far this picture's send time drifted from what its timestamp promised.
+   *
+   * This is RFC 3550's D term computed at the sender. HomeKit's jitter figure mixes our
+   * timing with the network's; measuring the same quantity here separates them. A large
+   * value on this side means the fault is ours before a packet ever leaves.
+   */
+  markSend(rtpTimestamp: number): void {
+    const now = Date.now()
+
+    if (this.#previousSendAt > 0) {
+      const arrivalMs = now - this.#previousSendAt
+
+      // RTP timestamps are 32-bit and wrap. Subtracting them as plain integers turns a
+      // wrap into a 2^32-tick step — about thirteen hours — which swamps the mean and
+      // makes the whole measurement useless. Truncating to a signed 32-bit difference
+      // reads a wrap as the small step it actually is.
+      const ticks = (rtpTimestamp - this.#previousStamp) | 0
+      const timestampMs = (ticks / 90_000) * 1000
+      const skew = Math.abs(arrivalMs - timestampMs)
+
+      this.#sendSkewTotal += skew
+      this.#sendSkewCount += 1
+      this.#sendSkewMax = Math.max(this.#sendSkewMax, skew)
+
+      // Count the outliers separately. A mean hides them, and it is precisely the rare
+      // large discontinuity that drives RFC 3550's smoothed estimate to where we see it.
+      if (skew > 100) {
+        this.#sendSkewSpikes += 1
+      }
+    }
+
+    this.#previousSendAt = now
+    this.#previousStamp = rtpTimestamp
+  }
+
   markAccessUnit(keyframe: boolean): void {
     this.#accessUnits += 1
 
@@ -83,6 +131,21 @@ export class SessionMetrics {
    */
   markReconfigure(width: number, height: number, maxBitrate: number): void {
     this.#reconfigurations.push({ at: Date.now() - this.#startedAt, height, maxBitrate, width })
+  }
+
+  /**
+   * Record what the receiver says about the stream we are sending it.
+   *
+   * This is the only direct measurement of loss a sender has. Everything else — the
+   * picture breaking up on movement, HomeKit renegotiating downward — is inference from
+   * symptoms.
+   */
+  markReceiverReport(report: ReceiverReport): void {
+    this.#reports += 1
+    this.#worstFractionLost = Math.max(this.#worstFractionLost, report.fractionLost)
+    this.#lastCumulativeLost = report.cumulativeLost
+    this.#peakJitter = Math.max(this.#peakJitter, report.jitter)
+    this.#lastJitter = report.jitter
   }
 
   get mode(): DeliveryMode | null {
@@ -104,7 +167,8 @@ export class SessionMetrics {
     return `${request.width.toString()}x${request.height.toString()}@${request.fps.toString()}fps ` +
       `${formatBitrate(request.maxBitrate)} -> ${tier.channelName} ` +
       `${tier.width.toString()}x${tier.height.toString()}@${tier.fps.toString()}fps | ` +
-      `${describeMode(selection.mode)} | first packet ${ttff} | ${stats.packetsSent.toString()} packets`
+      `${describeMode(selection.mode)} | first packet ${ttff} | ${stats.packetsSent.toString()} packets` +
+      ((this.#reports > 0) ? ` | ${this.#lastCumulativeLost.toString()} lost` : '')
   }
 
   /** The full record, for debug logging and the plugin UI. */
@@ -141,10 +205,34 @@ export class SessionMetrics {
     lines.push(`  Source open: ${this.#since(this.#sourceOpenAt)}`)
     lines.push(`  First RTP  : ${this.#since(this.#firstPacketAt)}`)
     lines.push(`  First IDR  : ${this.#since(this.#firstKeyframeAt)}`)
-    lines.push(`  Frames     : ${this.#accessUnits.toString()} (${this.#keyframes.toString()} keyframes)`)
+    const elapsedSeconds = (Date.now() - this.#startedAt) / 1000
+    const deliveredFps = (elapsedSeconds > 0) ? (this.#accessUnits / elapsedSeconds) : 0
+
+    // Delivered frame rate, not the configured one. A stream that is keeping up shows
+    // roughly the channel's rate; anything materially lower is a pause the viewer sees.
+    lines.push(`  Frames     : ${this.#accessUnits.toString()} (${this.#keyframes.toString()} keyframes), ${deliveredFps.toFixed(1)} fps delivered`)
     lines.push(`  Sent       : ${stats.packetsSent.toString()} packets, ${formatBytes(stats.bytesSent)}`)
     lines.push(`  Send errors: ${stats.sendErrors.toString()}`)
     lines.push(`  RTCP in    : ${stats.inboundPackets.toString()}`)
+
+    if (this.#reports > 0) {
+      const share = (stats.packetsSent > 0)
+        ? ` (${((this.#lastCumulativeLost / stats.packetsSent) * 100).toFixed(2)}% of packets sent)`
+        : ''
+
+      lines.push(`  Reports in : ${this.#reports.toString()}`)
+      lines.push(`  Packet loss: ${this.#lastCumulativeLost.toString()} total${share}, worst interval ${(this.#worstFractionLost * 100).toFixed(2)}%`)
+      lines.push(`  Jitter     : ${this.#lastJitter.toString()} ticks now, ${this.#peakJitter.toString()} peak (${(this.#peakJitter / 90).toFixed(0)} ms)`)
+    }
+
+    if (this.#sendSkewCount > 0) {
+      const meanSkew = (this.#sendSkewTotal / this.#sendSkewCount).toFixed(1)
+
+      lines.push(`  Send skew  : ${meanSkew} ms mean, ${this.#sendSkewMax.toFixed(0)} ms worst, ` +
+        `${this.#sendSkewSpikes.toString()} over 100 ms (our own timing)`)
+    } else {
+      lines.push('  Packet loss: no receiver reports decoded')
+    }
 
     for (const note of selection.notes) {
       lines.push(`  Note       : ${note}`)

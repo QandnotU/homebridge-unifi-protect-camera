@@ -15,13 +15,14 @@ import type { ScopedLogger } from '../core/logger.js'
 import { H264Packetizer, RTP_HEADER_SIZE, maxPayloadSize } from '../media/rtp/h264-packetizer.js'
 import { RtpSender } from '../media/rtp/sender.js'
 import { SessionMetrics } from '../diagnostics/session-metrics.js'
-import { SrtcpSession } from '../media/rtp/srtcp.js'
+import { SnapshotCache } from '../media/snapshot/snapshot-cache.js'
+import { SrtcpSession, parseReceiverReports } from '../media/rtp/srtcp.js'
 import { SrtpSession } from '../media/rtp/srtp.js'
 import { VideoSource } from '../media/broker/video-source.js'
-import { delay, isAbortError } from '../core/lifecycle.js'
+import { isAbortError } from '../core/lifecycle.js'
 import { selectStream } from '../media/select/stream-selector.js'
 import { toAnnexB } from '../media/fmp4/avcc.js'
-import { RTP_VIDEO_CLOCK, toRtpTimestamp } from '../media/fmp4/init-segment.js'
+import { toRtpTimestamp } from '../media/fmp4/init-segment.js'
 
 /**
  * HAP's `StreamRequestTypes` is an *ambient const enum*, which `verbatimModuleSyntax`
@@ -35,31 +36,93 @@ const START = 'start'
 const RECONFIGURE = 'reconfigure'
 
 /**
- * How far ahead of the media clock the sender may run before it waits.
+ * Pictures are sent on the media clock, not as they arrive.
  *
- * Protect delivers roughly three pictures per 100 ms segment, and releasing them all at
- * once produces a burst well above the stream's average rate. On a moving scene those
- * pictures are large, and the burst overruns the receiver's buffer — which shows up as
- * corruption concentrated in the moving parts of the frame, and provokes HomeKit into
- * renegotiating down to a lower resolution.
+ * Protect delivers roughly three pictures at once every 100 ms. Forwarding them as they
+ * arrive sends a burst and then idles, which puts every frame's departure about a frame
+ * period away from the time its own timestamp claims: measured at 46.5 ms mean against a
+ * 33 ms frame interval, which is exactly what the arithmetic predicts for an unpaced
+ * burst ((33 + 33 + 67) / 3 = 44.3).
  *
- * Pacing to the media clock spreads them evenly instead. This is what a conventional RTP
- * sender does; we only notice its absence because the source arrives in bursts.
+ * Three earlier schemes each fixed one measurement by breaking another, and pacing was
+ * abandoned. This is the first of them — a fixed wall-clock anchor — restored, because its
+ * failure had a cause that has since been removed. It drifted and then jumped to correct
+ * itself; the drift was in the clock it was pacing against, which was reconstructed from
+ * per-segment spacing and ran 0.92% slow (measured: 463 ms lost over 289 segments). Now
+ * that segments are anchored to the controller's own `tfdt` timeline, a fixed anchor has a
+ * reference that does not move under it.
+ *
+ * The lead exists because a segment's last picture is due 67 ms after its first but
+ * arrives at the same instant: without it we would be sending late from the first frame.
+ * Falling far behind re-anchors rather than sending a catch-up burst, which is what made
+ * the original scheme visibly jump.
  */
-const PACING_LEAD_MS = 8
+/**
+ * Pin a Protect channel with `PROTECT_FORCE_CHANNEL` (0 High, 1 Medium, 2 Low).
+ *
+ * A diagnostic, not a feature. Selection currently matches on resolution and ignores the
+ * bitrate HomeKit negotiated, so a 1280x720 request is served the Medium channel at 2.0
+ * Mbps against a 299 Kbps budget. Pinning the Low channel puts the source inside the budget
+ * and answers whether the overrun is what breaks the picture on movement — without
+ * rebuilding, and without changing selection for everyone before the answer is known.
+ */
+const FORCED_CHANNEL = ((): number | null => {
+  const configured = Number(process.env['PROTECT_FORCE_CHANNEL'])
 
-/** Never wait longer than this, so a timestamp jump cannot stall the stream. */
+  return (Number.isInteger(configured) && (configured >= 0) && (configured <= 2)) ? configured : null
+})()
+
+const DEFAULT_PACING_LEAD_MS = 150
+
+/**
+ * Override with `PROTECT_PACING_LEAD_MS`, so the trade can be explored without a rebuild.
+ *
+ * A larger lead gives the pacer more slack to absorb a segment that arrives late, at the
+ * cost of live latency. Measured on a G5 Bullet: 60 ms left a visible pause, 250 ms removed
+ * it and produced the cleanest transport numbers of the project (0.9 ms mean send skew,
+ * 147 ms jitter, zero loss, zero discards) — while movement artifacts returned, which those
+ * numbers cannot explain. Treat the two as independent until something proves otherwise.
+ */
+const PACING_LEAD_MS = ((): number => {
+  const configured = Number(process.env['PROTECT_PACING_LEAD_MS'])
+
+  return (Number.isFinite(configured) && (configured >= 0) && (configured <= 2000))
+    ? configured
+    : DEFAULT_PACING_LEAD_MS
+})()
+
+/** Never sleep longer than this in one step, so teardown stays responsive. */
 const PACING_MAX_WAIT_MS = 250
 
 /**
- * How far behind schedule the sender may fall before it stops trying to catch up.
+ * Lag past which catching up frame by frame would take longer than the lag itself.
  *
- * Catching up means transmitting the backlog as fast as the loop runs, which is the burst
- * that pacing exists to avoid — the stream freezes and then races, shedding packets as it
- * goes. Past this point the schedule is re-anchored instead: the latency already incurred
- * is accepted, and delivery stays even from there.
+ * Re-anchoring drops the backlog instead of replaying it at speed.
  */
-const PACING_RESYNC_MS = 400
+const PACING_RESYNC_MS = 500
+
+/** An abortable sleep. Resolves early, and without throwing, when the session ends. */
+function delay(ms: number, signal: AbortSignal): Promise<void> {
+  return new Promise(resolve => {
+    if (signal.aborted) {
+      resolve()
+
+      return
+    }
+
+    const timer = setTimeout(() => {
+      signal.removeEventListener('abort', onAbort)
+      resolve()
+    }, ms)
+
+    function onAbort(): void {
+      clearTimeout(timer)
+      resolve()
+    }
+
+    signal.addEventListener('abort', onAbort, { once: true })
+  })
+}
 
 /**
  * Set `PROTECT_DUMP_DIR` to write each session's video to an Annex-B `.h264` file.
@@ -73,27 +136,6 @@ const PACING_RESYNC_MS = 400
  *   ffplay /tmp/protect/<session>.h264
  */
 const DUMP_DIR = process.env['PROTECT_DUMP_DIR'] ?? ''
-
-/**
- * How many pauses a single frame's packets may be broken up with.
- *
- * A keyframe captured during movement was measured at 107 KB — 79 packets — and releasing
- * those with no gap puts roughly 109 KB on the wire at once, far above the stream's
- * 569 Kbps average. Enough of that burst is lost that the keyframe is damaged, and every
- * picture referencing it stays corrupt until the next one.
- *
- * The count is bounded rather than the group size, because the cost of a pause is not the
- * millisecond requested. Node's timers resolve to whole milliseconds and overshoot under
- * load, so a pause costs 1–4 ms in practice. Spacing every eight packets meant nine pauses
- * for that keyframe — up to 36 ms, past its 33 ms budget at 30 fps. The sender then fell
- * further behind the media clock on every large frame until a resync caught it up in one
- * burst: better at first, then degrading. Four pauses cost at most ~16 ms and still break
- * the frame into fifths.
- */
-const MAX_FRAME_PAUSES = 4
-
-/** Below this, a frame is small enough to send in one go. Median frame is ~1.6 KB. */
-const PAUSE_ABOVE_PACKETS = 8
 
 /** The start variant of {@link StreamingRequest}, which is the one carrying full video info. */
 type StartStreamRequest = Extract<StreamingRequest, { video: VideoInfo }>
@@ -145,17 +187,34 @@ export class ProtectStreamingDelegate implements CameraStreamingDelegate {
   readonly #options: StreamingDelegateOptions
   readonly #log: ScopedLogger
   readonly #sessions = new Map<string, PreparedSession>()
+  readonly #snapshots: SnapshotCache
 
   constructor(options: StreamingDelegateOptions) {
     this.#options = options
     this.#log = options.log
+
+    // The accessory's signal, not any one request's: a fetch shared between tiles must not
+    // be cancelled because the tile that started it went away.
+    this.#snapshots = new SnapshotCache({
+      // Spread rather than assign: `exactOptionalPropertyTypes` distinguishes an absent
+      // property from one set to undefined, and the library's options mean the former.
+      load: (size, signal) => options.camera.snapshot({
+        signal,
+        ...((size.height === undefined) ? {} : { height: size.height }),
+        ...((size.width === undefined) ? {} : { width: size.width }),
+      }),
+    })
   }
 
   handleSnapshotRequest(request: SnapshotRequest, callback: SnapshotRequestCallback): void {
-    this.#options.camera.snapshot({ height: request.height, signal: this.#options.lifecycle.signal, width: request.width })
+    this.#snapshots.get({ height: request.height, width: request.width }, this.#options.lifecycle.signal)
       .then(image => { callback(undefined, image) })
       .catch((error: unknown) => {
-        this.#log.debug('Snapshot failed: %s', error instanceof Error ? error.message : String(error))
+        const stats = this.#snapshots.stats
+
+        this.#log.debug('Snapshot failed: %s (%s served stale, %s coalesced, %s failures)',
+          error instanceof Error ? error.message : String(error),
+          stats.staleServed.toString(), stats.coalesced.toString(), stats.failures.toString())
         callback(error instanceof Error ? error : new Error('snapshot failed'))
       })
   }
@@ -174,10 +233,30 @@ export class ProtectStreamingDelegate implements CameraStreamingDelegate {
 
     void (async (): Promise<void> => {
       try {
+        const ssrc = randomInt(1, 0xffffffff)
+        const srtp = new SrtpSession(request.video.srtp_key, request.video.srtp_salt, ssrc)
+        const srtcp = new SrtcpSession(request.video.srtp_key, request.video.srtp_salt, ssrc)
+
         const [videoSender, audioSender] = await Promise.all([
           RtpSender.bind({
             address: request.targetAddress,
             addressVersion: request.addressVersion,
+            // HomeKit multiplexes its receiver reports onto the RTP port. Decrypting them
+            // turns "the picture looks wrong" into a packet-loss figure.
+            onInbound: packet => {
+              const rtcp = srtcp.unprotect(packet)
+
+              if (!rtcp) {
+                return
+              }
+
+              for (const report of parseReceiverReports(rtcp)) {
+                // Reports about other synchronisation sources are not about our stream.
+                if (report.source === ssrc) {
+                  metrics.markReceiverReport(report)
+                }
+              }
+            },
             port: request.video.port,
             signal: lifecycle.signal,
           }),
@@ -188,10 +267,6 @@ export class ProtectStreamingDelegate implements CameraStreamingDelegate {
             signal: lifecycle.signal,
           }),
         ])
-
-        const ssrc = randomInt(1, 0xffffffff)
-        const srtp = new SrtpSession(request.video.srtp_key, request.video.srtp_salt, ssrc)
-        const srtcp = new SrtcpSession(request.video.srtp_key, request.video.srtp_salt, ssrc)
 
         this.#sessions.set(request.sessionID,
           { audioSender, control: { pendingChannelId: null }, lifecycle, metrics, srtcp, srtp, ssrc, videoSender })
@@ -242,7 +317,7 @@ export class ProtectStreamingDelegate implements CameraStreamingDelegate {
           { codec: capabilities.codec, maximumQuality: this.#options.maximumQuality },
         )
 
-        if (selection && !selection.mode.endsWith('transcode')) {
+        if (selection && !selection.mode.endsWith('transcode') && (FORCED_CHANNEL === null)) {
           session.control.pendingChannelId = selection.tier.channelId
         }
 
@@ -307,7 +382,7 @@ export class ProtectStreamingDelegate implements CameraStreamingDelegate {
 
     // HomeKit expects the callback promptly; the stream then runs until the session ends.
     callback()
-    void this.#pump(request.sessionID, session, selection.tier.channelId, video.mtu, video.pt)
+    void this.#pump(request.sessionID, session, FORCED_CHANNEL ?? selection.tier.channelId, video.mtu, video.pt)
   }
 
   /**
@@ -355,9 +430,6 @@ export class ProtectStreamingDelegate implements CameraStreamingDelegate {
 
     let channelId = initialChannelId
     let timestampOffset = 0
-    let pacingBase: number | null = null
-    let pacingStart: number | null = null
-    let resyncs = 0
     let first = true
 
     try {
@@ -382,6 +454,7 @@ export class ProtectStreamingDelegate implements CameraStreamingDelegate {
 
           // After a switch, resume the RTP clock where it left off.
           let base: number | null = null
+          let paceStart: number | null = null
           // Wait for a keyframe before sending anything, on every generation including the
           // first. Protect hands us whatever point of the GOP the stream happens to be at,
           // so a session that starts mid-GOP begins with inter-coded pictures referencing
@@ -392,10 +465,36 @@ export class ProtectStreamingDelegate implements CameraStreamingDelegate {
           session.lifecycle.add(() => {
             const upstream = source.stats
 
-            this.#log.info('Stream health: %s pacing resync%s, upstream queue peak %s, %s segment%s discarded.',
-              resyncs.toString(), resyncs === 1 ? '' : 's',
+            this.#log.info('Pacing lead: %s ms%s.', PACING_LEAD_MS.toString(),
+              (FORCED_CHANNEL === null) ? '' : `, channel pinned to ${FORCED_CHANNEL.toString()}`)
+
+            this.#log.info('Stream health (channel %s): upstream queue peak %s, %s segment%s discarded.',
+              channelId.toString(),
               String(upstream?.peakQueueDepth ?? 0),
               String(upstream?.discarded ?? 0), (upstream?.discarded === 1) ? '' : 's')
+
+            // Our reconstructed clock against the one the controller actually stamped.
+            // Measurement only: nothing downstream reads it yet.
+            const timeline = source.timeline
+            const timescale = source.track.timescale || 90_000
+
+            if (timeline.samples > 0) {
+              // Drift is what the old synthesised clock *would* have accumulated. Now that
+              // segments are anchored to tfdt, it measures the error removed rather than
+              // the error carried.
+              this.#log.info('Timeline (channel %s): anchored to tfdt, avoided %s ms of drift over %s segments, %s discontinuit%s.',
+                channelId.toString(),
+                ((timeline.driftNow / timescale) * 1000).toFixed(0), timeline.samples.toString(),
+                timeline.discontinuities.toString(), (timeline.discontinuities === 1) ? 'y' : 'ies')
+            } else {
+              this.#log.warn('Timeline (channel %s): no tfdt in the segments; falling back to the synthesised clock.',
+                channelId.toString())
+            }
+
+            if (timeline.mismatches || timeline.trunDisagreements) {
+              this.#log.info('Segment timing (channel %s): %s with a timestamp-count mismatch, %s where the splitter disagreed with the sample table.',
+                channelId.toString(), timeline.mismatches.toString(), timeline.trunDisagreements.toString())
+            }
           })
 
           for await (const unit of source.accessUnits()) {
@@ -417,52 +516,44 @@ export class ProtectStreamingDelegate implements CameraStreamingDelegate {
 
             base ??= unit.timestamp
 
+            // Hold the picture until its own timestamp says it is due.
+            const dueMs = ((unit.timestamp - base) / source.track.timescale) * 1000
+
+            paceStart ??= Date.now() - dueMs + PACING_LEAD_MS
+
+            const waitMs = (paceStart + dueMs) - Date.now()
+
+            if (waitMs > 0) {
+              await delay(Math.min(waitMs, PACING_MAX_WAIT_MS), session.lifecycle.signal)
+
+              if (session.lifecycle.signal.aborted) {
+                return
+              }
+            } else if (waitMs < -PACING_RESYNC_MS) {
+              paceStart = Date.now() - dueMs
+            }
+
             const relative = toRtpTimestamp(unit.timestamp - base, source.track.timescale)
 
             lastTimestamp = timestampOffset + relative
             session.metrics.markAccessUnit(unit.keyframe)
+            session.metrics.markSend(lastTimestamp)
 
-            // Pace to the media clock rather than to the arrival of segments.
-            pacingBase ??= lastTimestamp
-            pacingStart ??= performance.now()
-
-            const dueAt = pacingStart + (((lastTimestamp - pacingBase) / RTP_VIDEO_CLOCK) * 1000)
-            const wait = dueAt - performance.now()
-
-            if (wait > PACING_LEAD_MS) {
-              try {
-                await delay(Math.min(wait, PACING_MAX_WAIT_MS), session.lifecycle.signal)
-              } catch {
-                return
-              }
-            } else if (wait < -PACING_RESYNC_MS) {
-              resyncs += 1
-              pacingBase = lastTimestamp
-              pacingStart = performance.now()
-            }
-
+            // Pace relative to the previous picture, not to a fixed anchor at session
+            // start. An absolute anchor accumulates the difference between our media clock
+            // and real time — about 0.8% per second measured here — until it is far enough
+            // behind to need a correction, and that correction is a discontinuity the
+            // receiver sees as ~800ms of interarrival jitter. Spacing each picture from the
+            // last one self-corrects: falling behind simply means sending now and carrying
+            // on evenly, with nothing to accumulate.
             dump?.write(toAnnexB(unit.nals))
 
             const packets = packetizer.packetizeAccessUnit(unit.nals, lastTimestamp)
 
-            // Break a large frame into at most MAX_FRAME_PAUSES + 1 groups; small frames
-            // go out in one piece.
-            const groupSize = (packets.length > PAUSE_ABOVE_PACKETS)
-              ? Math.ceil(packets.length / (MAX_FRAME_PAUSES + 1))
-              : packets.length
-
-            for (const [index, packet] of packets.entries()) {
+            for (const packet of packets) {
               rtpPackets += 1
               rtpOctets += packet.length - RTP_HEADER_SIZE
               session.videoSender.send(session.srtp.protect(packet))
-
-              if (((index + 1) % groupSize === 0) && ((index + 1) < packets.length)) {
-                try {
-                  await delay(1, session.lifecycle.signal)
-                } catch {
-                  return
-                }
-              }
             }
 
             session.metrics.markFirstPacket()
@@ -480,8 +571,6 @@ export class ProtectStreamingDelegate implements CameraStreamingDelegate {
 
         // Leave a frame's gap so the new stream's first timestamp is strictly greater.
         timestampOffset = lastTimestamp + 3000
-        pacingBase = null
-        pacingStart = null
         channelId = next
         this.#log.debug('Switching to channel %s.', channelId.toString())
       }
