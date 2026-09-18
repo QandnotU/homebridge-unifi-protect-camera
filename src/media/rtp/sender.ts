@@ -8,6 +8,11 @@ export interface RtpSenderOptions {
   readonly addressVersion: 'ipv4' | 'ipv6'
   /** Aborting closes the socket. */
   readonly signal: AbortSignal
+  /**
+   * Called for each inbound datagram. HomeKit multiplexes its RTCP receiver reports onto
+   * the RTP port, and those carry the only direct measurement of packet loss a sender has.
+   */
+  readonly onInbound?: (packet: Buffer) => void
 }
 
 export interface SenderStats {
@@ -52,9 +57,10 @@ export class RtpSender {
     this.#address = options.address
     this.#port = options.port
 
-    socket.on('message', () => {
+    socket.on('message', message => {
       this.#inboundPackets += 1
       this.#lastInboundAt = Date.now()
+      options.onInbound?.(message)
     })
 
     // A UDP socket can surface ICMP port-unreachable as an error event. Swallowing it
