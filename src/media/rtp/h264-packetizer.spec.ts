@@ -24,9 +24,17 @@ function nal(header: number, length: number): Buffer {
 }
 
 describe('maxPayloadSize', () => {
-  it('reserves room for the RTP header and the SRTP auth tag', () => {
-    // HomeKit's IPv4 default MTU.
-    expect(maxPayloadSize(1378)).toBe(1378 - 12 - 10)
+  it('reserves room for IP, UDP, the RTP header and the SRTP auth tag', () => {
+    // HomeKit's MTU describes the IP datagram, so IP (20) and UDP (8) come out of the
+    // budget too. Omitting them puts 1406 bytes on the wire for a 1378 byte MTU.
+    expect(maxPayloadSize(1378)).toBe(1378 - 28 - 12 - 10)
+  })
+
+  it('keeps the whole datagram inside the MTU', () => {
+    const mtu = 1378
+    const datagram = maxPayloadSize(mtu) + 12 + 10 + 28
+
+    expect(datagram).toBe(mtu)
   })
 })
 

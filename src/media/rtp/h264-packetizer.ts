@@ -26,15 +26,24 @@ export interface PacketizerOptions {
   readonly initialSequence?: number
 }
 
+/** IPv4 header plus UDP header — the cost of putting a packet on the wire. */
+export const IP_UDP_OVERHEAD = 28
+
 /**
- * Bytes left for RTP payload inside a given MTU once the RTP header and the SRTP
- * authentication tag are accounted for.
+ * Bytes left for RTP payload inside a given MTU.
  *
- * Getting this wrong is the classic cause of a stream that negotiates cleanly and then
- * shows nothing: oversized packets fragment at the IP layer, and HomeKit drops them.
+ * The MTU HomeKit negotiates describes the **IP datagram**, not the RTP packet, so the
+ * IP and UDP headers come out of the budget along with the RTP header and the SRTP
+ * authentication tag. Counting only the latter two overshoots by 28 bytes.
+ *
+ * That overshoot is invisible on small frames and only bites on large ones: a stream
+ * whose median picture is a few hundred bytes sends nothing near the limit until motion
+ * or a keyframe forces fragmentation, at which point every fragment is maximum-sized.
+ * The result is corruption that appears only during movement, with no packet loss
+ * reported — which reads convincingly as a network problem and is not one.
  */
 export function maxPayloadSize(mtu: number): number {
-  return mtu - RTP_HEADER_SIZE - SRTP_AUTH_TAG_SIZE
+  return mtu - IP_UDP_OVERHEAD - RTP_HEADER_SIZE - SRTP_AUTH_TAG_SIZE
 }
 
 /**
