@@ -15,6 +15,7 @@ import type { ScopedLogger } from '../core/logger.js'
 import { H264Packetizer, RTP_HEADER_SIZE, maxPayloadSize } from '../media/rtp/h264-packetizer.js'
 import { RtpSender } from '../media/rtp/sender.js'
 import { SessionMetrics } from '../diagnostics/session-metrics.js'
+import { FfmpegDelivery } from '../media/ffmpeg/ffmpeg-delivery.js'
 import { SnapshotCache } from '../media/snapshot/snapshot-cache.js'
 import { SrtcpSession, parseReceiverReports } from '../media/rtp/srtcp.js'
 import { SrtpSession } from '../media/rtp/srtp.js'
@@ -71,6 +72,16 @@ const FORCED_CHANNEL = ((): number | null => {
 
   return (Number.isInteger(configured) && (configured >= 0) && (configured <= 2)) ? configured : null
 })()
+
+/**
+ * Set `PROTECT_DELIVERY=ffmpeg` to deliver through FFmpeg's RTP muxer instead of our own.
+ *
+ * An A/B reference. Our path measures clean from the sender — zero loss, 14 ms jitter,
+ * 1.4 ms send skew, packetization verified byte-for-byte — and still artifacts on movement,
+ * which is not diagnosable from inside the sender. Video is copied either way, so the only
+ * difference under test is packetization and pacing.
+ */
+const USE_FFMPEG = process.env['PROTECT_DELIVERY'] === 'ffmpeg'
 
 const DEFAULT_PACING_LEAD_MS = 150
 
@@ -160,6 +171,8 @@ interface PreparedSession {
   readonly srtp: SrtpSession
   readonly srtcp: SrtcpSession
   readonly ssrc: number
+  /** Where HomeKit wants RTP sent, kept for the FFmpeg comparison path. */
+  readonly destination: { address: string, port: number, srtpKey: Buffer, srtpSalt: Buffer }
   /**
    * Channel the pump should switch to, set when HomeKit reconfigures the session.
    * Mutable by design: the pump is a long-running loop and this is how it is steered.
@@ -269,7 +282,17 @@ export class ProtectStreamingDelegate implements CameraStreamingDelegate {
         ])
 
         this.#sessions.set(request.sessionID,
-          { audioSender, control: { pendingChannelId: null }, lifecycle, metrics, srtcp, srtp, ssrc, videoSender })
+          {
+            audioSender,
+            control: { pendingChannelId: null },
+            destination: {
+              address: request.targetAddress,
+              port: request.video.port,
+              srtpKey: request.video.srtp_key,
+              srtpSalt: request.video.srtp_salt,
+            },
+            lifecycle, metrics, srtcp, srtp, ssrc, videoSender,
+          })
 
         callback(undefined, {
           audio: {
@@ -386,6 +409,50 @@ export class ProtectStreamingDelegate implements CameraStreamingDelegate {
   }
 
   /**
+   * The FFmpeg comparison path.
+   *
+   * Deliberately minimal: no channel switching, no per-session metrics, no receiver-report
+   * decoding. FFmpeg owns the socket here, so our instruments cannot see the stream, and
+   * the question this answers is not a numeric one — it is whether the picture is clean
+   * when someone else does the packetization.
+   */
+  async #pumpThroughFfmpeg(
+    sessionId: string,
+    session: PreparedSession,
+    channelId: number,
+    mtu: number,
+    payloadType: number,
+  ): Promise<void> {
+    const options = {
+      address: session.destination.address,
+      camera: this.#options.camera,
+      channelId,
+      log: this.#log,
+      mtu,
+      payloadType,
+      port: session.destination.port,
+      signal: session.lifecycle.signal,
+      srtpKey: session.destination.srtpKey,
+      srtpSalt: session.destination.srtpSalt,
+      ssrc: session.ssrc,
+    }
+
+    // Our own socket holds no claim on HomeKit's receiving port, but it is bound and idle
+    // for the whole session; closing it makes it unambiguous who is sending.
+    session.videoSender.close()
+
+    try {
+      await FfmpegDelivery.start(options).pump(options)
+    } catch (error) {
+      this.#log.error('FFmpeg delivery failed: %s', error instanceof Error ? error.message : String(error))
+    } finally {
+      this.#log.info('FFmpeg session ended (channel %s).', channelId.toString())
+      this.#sessions.delete(sessionId)
+      await session.lifecycle.dispose()
+    }
+  }
+
+  /**
    * Stream until the session ends, switching source when HomeKit reconfigures.
    *
    * The packetizer and SRTP session persist across a switch so RTP sequence numbers stay
@@ -399,6 +466,12 @@ export class ProtectStreamingDelegate implements CameraStreamingDelegate {
     mtu: number,
     payloadType: number,
   ): Promise<void> {
+    if (USE_FFMPEG) {
+      await this.#pumpThroughFfmpeg(sessionId, session, initialChannelId, mtu, payloadType)
+
+      return
+    }
+
     const packetizer = new H264Packetizer({ maxPayloadSize: maxPayloadSize(mtu), payloadType, ssrc: session.ssrc })
 
     let lastTimestamp = 0
