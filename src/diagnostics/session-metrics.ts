@@ -1,4 +1,5 @@
 import type { DeliveryMode, StreamSelection } from '../media/select/stream-selector.js'
+import type { StreamTier } from '../protect/capabilities.js'
 import type { ReceiverReport } from '../media/rtp/srtcp.js'
 import type { SenderStats } from '../media/rtp/sender.js'
 import { describeMode, formatBitrate, isTranscoding } from '../media/select/stream-selector.js'
@@ -32,6 +33,14 @@ export class SessionMetrics {
 
   #request: RequestedVideo | null = null
   #selection: StreamSelection | null = null
+
+  /**
+   * The tier actually streamed, when it is not the one selection chose.
+   *
+   * A summary that names a different channel than the session used is worse than no
+   * summary: it was read as evidence during diagnosis before the contradiction was spotted.
+   */
+  #actualTier: StreamTier | null = null
   #codec = 'unknown'
   #sourceOpenAt: number | null = null
   #firstPacketAt: number | null = null
@@ -61,6 +70,11 @@ export class SessionMetrics {
 
   markRequest(request: RequestedVideo): void {
     this.#request = request
+  }
+
+  /** Record the tier the stream really opened on, overriding the selected one. */
+  markActualTier(tier: StreamTier): void {
+    this.#actualTier = tier
   }
 
   markSelection(selection: StreamSelection, codec: string): void {
@@ -161,7 +175,7 @@ export class SessionMetrics {
       return `${this.#sessionId}: session ended before it started`
     }
 
-    const tier = selection.tier
+    const tier = this.#actualTier ?? selection.tier
     const ttff = (this.#firstPacketAt === null) ? 'no video' : `${(this.#firstPacketAt - this.#startedAt).toString()} ms`
 
     return `${request.width.toString()}x${request.height.toString()}@${request.fps.toString()}fps ` +
@@ -181,7 +195,7 @@ export class SessionMetrics {
       return [`Session ${this.#sessionId} ended before a stream was negotiated.`]
     }
 
-    const tier = selection.tier
+    const tier = this.#actualTier ?? selection.tier
 
     lines.push('HomeKit Request')
     lines.push(`  Resolution : ${request.width.toString()}x${request.height.toString()}`)

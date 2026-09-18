@@ -440,6 +440,11 @@ export class ProtectStreamingDelegate implements CameraStreamingDelegate {
 
         try {
           const tier = this.#options.capabilities().tiers.find(entry => entry.channelId === channelId)
+
+          if (tier) {
+            session.metrics.markActualTier(tier)
+          }
+
           const source = await VideoSource.open({
             camera: this.#options.camera,
             channelId,
