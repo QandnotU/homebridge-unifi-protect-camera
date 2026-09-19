@@ -26,7 +26,7 @@ import { readTrackInfo } from '../fmp4/init-segment.js'
  * `trun`, which is the only thing that actually knows where video ends.
  */
 export function videoTrack(segment: { data?: Buffer, moof?: Buffer }, videoTrackId: number | null):
-  { payload: Buffer, compositionOffsets: readonly number[], sampleCount: number } | null {
+  { payload: Buffer, compositionOffsets: readonly number[], sampleCount: number, durations: readonly number[] } | null {
   const data = segment.data
 
   if (!data) {
@@ -44,7 +44,15 @@ export function videoTrack(segment: { data?: Buffer, moof?: Buffer }, videoTrack
       const end = start + video.totalBytes
 
       if ((start >= 0) && (end <= data.length)) {
-        return { compositionOffsets: video.compositionOffsets, payload: data.subarray(start, end), sampleCount: video.sampleCount }
+        return {
+          compositionOffsets: video.compositionOffsets,
+          // A trun that omits durations still states the fragment's default.
+          durations: (video.durations.length > 0)
+            ? video.durations
+            : Array.from({ length: video.sampleCount }, () => video.defaultSampleDuration),
+          payload: data.subarray(start, end),
+          sampleCount: video.sampleCount,
+        }
       }
     }
   }
@@ -54,7 +62,7 @@ export function videoTrack(segment: { data?: Buffer, moof?: Buffer }, videoTrack
   // mismatch described above. A degraded stream beats no stream.
   for (const box of iterateBoxes(data)) {
     if (box.type === 'mdat') {
-      return { compositionOffsets: [], payload: box.body, sampleCount: 0 }
+      return { compositionOffsets: [], durations: [], payload: box.body, sampleCount: 0 }
     }
   }
 
@@ -111,6 +119,8 @@ export class VideoSource {
   #driftSamples = 0
   #discontinuities = 0
   #trunDisagreements = 0
+  #backwardSteps = 0
+  #lastEmitted: number | null = null
 
   private constructor(
     config: AvcConfig,
@@ -215,7 +225,7 @@ export class VideoSource {
    */
   get timeline(): {
     driftNow: number, driftPeak: number, samples: number, discontinuities: number,
-    anchored: boolean, mismatches: number, trunDisagreements: number,
+    anchored: boolean, mismatches: number, trunDisagreements: number, backwardSteps: number,
     } {
     return {
       anchored: this.#tfdtBase !== null,
@@ -224,6 +234,7 @@ export class VideoSource {
       driftPeak: this.#driftPeak,
       mismatches: this.#mismatches,
       samples: this.#driftSamples,
+      backwardSteps: this.#backwardSteps,
       trunDisagreements: this.#trunDisagreements,
     }
   }
@@ -348,9 +359,31 @@ export class VideoSource {
         ? (this.#clockBase + (tfdt - this.#tfdtBase))
         : clock
 
+      // Space the fragment's pictures by the durations the sample table states.
+      //
+      // The controller supplies fewer per-frame timestamps than the fragment holds pictures
+      // in 98% of fragments, so those cannot carry the spacing. Synthesising a uniform
+      // interval instead is wrong: the real ones vary — a channel configured at 30 fps was
+      // measured emitting 2999, 3049, 2951, 3000 — and the error accumulates across the
+      // fragment. When it overshoots the next fragment's anchor the clock steps backwards,
+      // which a receiver treats as a discontinuity. Measured on the wire: six backward steps
+      // of 33 to 67 ticks in 29 seconds, against zero for a reference sender on the same
+      // camera, while the picture artifacted on movement.
+      //
+      // `trun` states each duration outright, so nothing has to be inferred.
+      const durations = track.durations
+      const cumulative: number[] = [0]
+
+      for (let index = 1; index < timed.length; index++) {
+        cumulative.push((cumulative[index - 1] ?? 0) + (durations[index - 1] ?? step))
+      }
+
       for (const [index, unit] of timed.entries()) {
-        // Guard against a non-monotonic segment: never emit a timestamp below the clock.
-        const offset = Math.max(0, unit.timestamp - first)
+        // Prefer the sample table's spacing; fall back to the supplied timestamps only when
+        // the fragment carried no durations at all.
+        const offset = (durations.length > 0)
+          ? (cumulative[index] ?? 0)
+          : Math.max(0, unit.timestamp - first)
 
         // Presentation time, not decode time. With B-frames the two differ, and RTP
         // carries presentation order — sending decode order plays pictures out of
@@ -362,7 +395,22 @@ export class VideoSource {
           this.#log.info('Stream uses B-frames; applying composition time offsets.')
         }
 
-        yield withParameterSets({ ...unit, timestamp: anchor + offset + composition }, this.#config)
+        const timestamp = anchor + offset + composition
+
+        // A backstop, not the fix. Anything that still moves the clock backwards is a bug
+        // upstream of here, so it is counted rather than quietly smoothed away.
+        if ((this.#lastEmitted !== null) && (timestamp <= this.#lastEmitted)) {
+          this.#backwardSteps += 1
+          this.#lastEmitted += 1
+
+          yield withParameterSets({ ...unit, timestamp: this.#lastEmitted }, this.#config)
+
+          continue
+        }
+
+        this.#lastEmitted = timestamp
+
+        yield withParameterSets({ ...unit, timestamp }, this.#config)
       }
 
       const span = Math.max(0, (timed.at(-1)?.timestamp ?? first) - first)

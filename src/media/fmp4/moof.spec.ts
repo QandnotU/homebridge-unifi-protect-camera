@@ -43,7 +43,10 @@ describe('parseMoof', () => {
     const runs = parseMoof(moof)
 
     expect(runs).toHaveLength(1)
-    expect(runs[0]).toEqual({ compositionOffsets: [], dataOffset: 248, sampleCount: 3, totalBytes: 600, trackId: 1 })
+    expect(runs[0]).toEqual({
+      compositionOffsets: [], dataOffset: 248, defaultSampleDuration: 0, durations: [],
+      sampleCount: 3, totalBytes: 600, trackId: 1,
+    })
   })
 
   it('separates video from audio, which is the whole point', () => {
@@ -81,7 +84,10 @@ describe('parseMoof', () => {
       box('trun', Buffer.concat([Buffer.from([0, 0x00, 0x00, 0x01]), u32(2, 100)])),
     ])))
 
-    expect(parseMoof(moof)[0]).toEqual({ compositionOffsets: [], dataOffset: 100, sampleCount: 2, totalBytes: 154, trackId: 7 })
+    expect(parseMoof(moof)[0]).toEqual({
+      compositionOffsets: [], dataOffset: 100, defaultSampleDuration: 3000, durations: [],
+      sampleCount: 2, totalBytes: 154, trackId: 7,
+    })
   })
 
   it('returns nothing for a moof with no track fragments', () => {
@@ -220,5 +226,36 @@ describe('readBaseMediaDecodeTime', () => {
 
     expect(readBaseMediaDecodeTime(moof, 1)).toBeNull()
     expect(readBaseMediaDecodeTime(moof, 99)).toBeNull()
+  })
+})
+
+describe('per-sample durations', () => {
+  // The interval between pictures is not the nominal one. A live G5 Bullet channel
+  // configured at 30 fps was measured emitting 2999, 3049, 2951, 3000 on a 90 kHz
+  // timescale. Spacing a fragment uniformly accumulates that error until the clock
+  // overshoots the next fragment and steps backwards.
+  it('reads the durations the trun states', () => {
+    // flags 0x000301: data-offset, sample-duration, sample-size.
+    const body = Buffer.concat([
+      Buffer.from([0, 0x00, 0x03, 0x01]),
+      u32(4, 0),
+      u32(2999, 100), u32(3049, 100), u32(2951, 100), u32(3000, 100),
+    ])
+    const moof = box('moof', box('traf', Buffer.concat([box('tfhd', u32(0, 1)), box('trun', body)])))
+    const run = parseMoof(moof)[0]
+
+    expect(run?.durations).toEqual([2999, 3049, 2951, 3000])
+    expect(run?.sampleCount).toBe(4)
+    expect(run?.totalBytes).toBe(400)
+  })
+
+  it('falls back to the tfhd default when the trun omits durations', () => {
+    // tfhd flags 0x000008 sets default_sample_duration; trun flags 0x000201 omit durations.
+    const header = box('tfhd', Buffer.concat([Buffer.from([0, 0x00, 0x00, 0x08]), u32(1, 3000)]))
+    const body = Buffer.concat([Buffer.from([0, 0x00, 0x02, 0x01]), u32(2, 0), u32(77), u32(77)])
+    const run = parseMoof(box('moof', box('traf', Buffer.concat([header, box('trun', body)]))))[0]
+
+    expect(run?.durations).toEqual([])
+    expect(run?.defaultSampleDuration).toBe(3000)
   })
 })

@@ -575,6 +575,13 @@ export class ProtectStreamingDelegate implements CameraStreamingDelegate {
               this.#log.info('Segment timing (channel %s): %s with a timestamp-count mismatch, %s where the splitter disagreed with the sample table.',
                 channelId.toString(), timeline.mismatches.toString(), timeline.trunDisagreements.toString())
             }
+
+            // Backward RTP timestamps read as a discontinuity to a receiver. This must be
+            // zero; anything else means the sample table's durations are not being followed.
+            if (timeline.backwardSteps > 0) {
+              this.#log.warn('Timeline (channel %s): %s backward timestamp step%s — the picture will break.',
+                channelId.toString(), timeline.backwardSteps.toString(), (timeline.backwardSteps === 1) ? '' : 's')
+            }
           })
 
           for await (const unit of source.accessUnits()) {

@@ -26,6 +26,20 @@ export interface TrackRun {
    * Empty when the `trun` omits them, which means every offset is zero.
    */
   readonly compositionOffsets: readonly number[]
+  /**
+   * Per-sample decode durations, in the track's timescale.
+   *
+   * The exact interval between pictures, which is not the nominal one. A G5 Bullet channel
+   * configured at 30 fps was measured emitting 2999, 3049, 2951, 3000 — a flat 3000 is
+   * wrong for most samples. Spacing a fragment's pictures uniformly therefore accumulates
+   * error across the fragment, and when that overshoots the next fragment's `tfdt` the RTP
+   * clock steps backwards, which a receiver reads as a discontinuity.
+   *
+   * Empty when the `trun` omits durations, in which case `defaultSampleDuration` applies.
+   */
+  readonly durations: readonly number[]
+  /** The `tfhd` default, used for any sample the `trun` does not size itself. */
+  readonly defaultSampleDuration: number
 }
 
 const TFHD_BASE_DATA_OFFSET = 0x000001
@@ -44,6 +58,7 @@ const TRUN_SAMPLE_COMPOSITION_OFFSET = 0x000800
 interface Tfhd {
   readonly trackId: number
   readonly defaultSampleSize: number
+  readonly defaultSampleDuration: number
 }
 
 function parseTfhd(body: Buffer): Tfhd | null {
@@ -64,7 +79,14 @@ function parseTfhd(body: Buffer): Tfhd | null {
     offset += 4
   }
 
+  let defaultSampleDuration = 0
+
   if (flags & TFHD_DEFAULT_SAMPLE_DURATION) {
+    if ((offset + 4) > body.length) {
+      return null
+    }
+
+    defaultSampleDuration = body.readUInt32BE(offset)
     offset += 4
   }
 
@@ -80,7 +102,7 @@ function parseTfhd(body: Buffer): Tfhd | null {
 
   // `default_sample_flags` would follow, but nothing here needs it.
 
-  return { defaultSampleSize, trackId }
+  return { defaultSampleDuration, defaultSampleSize, trackId }
 }
 
 interface TrunResult {
@@ -88,6 +110,7 @@ interface TrunResult {
   sampleCount: number
   totalBytes: number
   compositionOffsets: number[]
+  durations: number[]
 }
 
 function parseTrun(body: Buffer, defaultSampleSize: number): TrunResult | null {
@@ -126,8 +149,17 @@ function parseTrun(body: Buffer, defaultSampleSize: number): TrunResult | null {
 
   let totalBytes = 0
   const compositionOffsets: number[] = []
+  const durations: number[] = []
 
   for (let index = 0; index < sampleCount; index++) {
+    if (flags & TRUN_SAMPLE_DURATION) {
+      if ((offset + 4) > body.length) {
+        return null
+      }
+
+      durations.push(body.readUInt32BE(offset))
+    }
+
     const sizeOffset = offset + ((flags & TRUN_SAMPLE_DURATION) ? 4 : 0)
 
     if (flags & TRUN_SAMPLE_SIZE) {
@@ -153,7 +185,7 @@ function parseTrun(body: Buffer, defaultSampleSize: number): TrunResult | null {
     offset += perSample
   }
 
-  return { compositionOffsets, dataOffset, sampleCount, totalBytes }
+  return { compositionOffsets, dataOffset, durations, sampleCount, totalBytes }
 }
 
 /** Read every track fragment in a `moof` box. */
@@ -184,6 +216,8 @@ export function parseMoof(moof: Buffer): TrackRun[] {
             runs.push({
               compositionOffsets: run.compositionOffsets,
               dataOffset: run.dataOffset,
+              defaultSampleDuration: header.defaultSampleDuration,
+              durations: run.durations,
               sampleCount: run.sampleCount,
               totalBytes: run.totalBytes,
               trackId: header.trackId,
