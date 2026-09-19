@@ -51,6 +51,13 @@ unset PROTECT_PASS BODY
 
 if [ "$CODE" != "200" ]; then
   echo "✗ login failed (HTTP $CODE)."
+  case "$CODE" in
+    401) echo "  Wrong username or password." ;;
+    403) echo "  Rejected. Check this is a LOCAL Protect user rather than a Ubiquiti cloud account," ;
+         echo "  and note UniFi OS locks an account briefly after a failed attempt - wait a minute and retry." ;;
+    499) echo "  The account requires 2FA. Use a dedicated local user without it." ;;
+    000) echo "  Could not reach $HOST. Check the address and that you are on the same network." ;;
+  esac
   exit 1
 fi
 
