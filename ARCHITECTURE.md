@@ -750,6 +750,21 @@ Until that change is made, `hasConformingFrameRate()` flags the mismatch and
 `conformingAlternatives()` reports what the channel could be set to, so the plugin
 surfaces the problem instead of hiding it.
 
+#### The 1080p ceiling applies to recording too — verified 2026-09-18
+
+The ceiling is `H264Level.LEVEL4_0` in the live streaming path, so it was reasonable to
+wonder whether HKSV recording, which negotiates separately through `RecordingManagement`,
+escapes it. It does not.
+
+Measured against the incumbent plugin on this hardware: it advertised
+`HKSV: 2688x1512@30fps (High) [H264], 2 Mbps` and offered the 2K channel as the source,
+but a recorded event exported from the Home app came back **1920×1080**, H.264, AAC mono.
+Apple negotiates the recording down to the same ceiling.
+
+So nothing on the classic path reaches 2688×1512, for live view or for recording, in any
+plugin. Route B (HKSV3, whose tier model has no level field) remains the only way up, and
+it remains blocked on HAP-NodeJS.
+
 #### Gaps against Apple's HKSV3 tier profile (for later)
 
 Apple classifies this as a **2K camera**. Measured against that profile:
