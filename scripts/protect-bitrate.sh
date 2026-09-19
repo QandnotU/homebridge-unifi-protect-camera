@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Show, and optionally change, per-channel bitrates on a Protect camera.
+# Show, and optionally change, per-channel bitrate and frame rate on a Protect camera.
 #
 # Read-only unless --set is given, and a --set still requires typed confirmation showing
 # exactly what will change. Prompts for the password; never places it in argv, shell
@@ -7,6 +7,10 @@
 #
 #   show: bash scripts/protect-bitrate.sh 10.69.1.1
 #   set:  bash scripts/protect-bitrate.sh 10.69.1.1 --camera Office --channel Medium --set 500000
+#   fps:  bash scripts/protect-bitrate.sh 10.69.1.1 --camera Office --channel High --fps 30
+#
+# HomeKit negotiates only 15, 24 or 30 fps. A channel set to anything else cannot be
+# advertised honestly, which is what made the High channel at 20 fps unusable.
 set -euo pipefail
 
 HOST="${1:-}"
@@ -15,12 +19,14 @@ HOST="${1:-}"
 CAMERA=""
 CHANNEL=""
 TARGET=""
+FPS=""
 
 while [ $# -gt 0 ]; do
   case "$1" in
     --camera) CAMERA="${2:-}"; shift 2 ;;
     --channel) CHANNEL="${2:-}"; shift 2 ;;
     --set) TARGET="${2:-}"; shift 2 ;;
+    --fps) FPS="${2:-}"; shift 2 ;;
     *) echo "unknown argument: $1"; exit 1 ;;
   esac
 done
@@ -55,7 +61,7 @@ curl -sk -b "$JAR" --max-time 30 "https://$HOST/proxy/protect/api/bootstrap" -o 
 
 node -e '
 const fs = require("fs")
-const [bootPath, planPath, wantCamera, wantChannel, target] = process.argv.slice(1)
+const [bootPath, planPath, wantCamera, wantChannel, target, wantFps] = process.argv.slice(1)
 const bootstrap = JSON.parse(fs.readFileSync(bootPath, "utf8"))
 const rate = n => (n >= 1e6 ? (n / 1e6).toFixed(1) + " Mbps" : Math.round(n / 1e3) + " Kbps")
 
@@ -67,14 +73,21 @@ for (const camera of bootstrap.cameras ?? []) {
   for (const channel of camera.channels ?? []) {
     const mark = (wantChannel && (channel.name === wantChannel)) ? "  <-" : ""
 
-    console.log(`  ${String(channel.name).padEnd(16)} ${channel.width}x${channel.height}@${channel.fps}` +
+    const auto = [channel.autoBitrate ? "autoBitrate" : "", channel.autoFps ? "autoFps" : ""].filter(Boolean).join(" ")
+
+    console.log(`  ${String(channel.name).padEnd(16)} ${channel.width}x${channel.height}@${channel.fps}fps` +
       `   current ${rate(channel.bitrate).padStart(9)}` +
       `   allowed ${rate(channel.minBitrate)} .. ${rate(channel.maxBitrate)}${mark}`)
+    console.log(`  ${" ".repeat(16)} fps offered: ${(channel.fpsValues ?? []).join(", ") || "(none reported)"}`)
+
+    if (auto) { console.log(`  ${" ".repeat(16)} automatic: ${auto} - an explicit setting may be overridden`) }
   }
 }
 
-if (!target) {
-  console.log("\nRead-only. To change one: --camera <name> --channel <name> --set <bits per second>")
+if (!target && !wantFps) {
+  console.log("\nRead-only. To change one:")
+  console.log("  --camera <name> --channel <name> --set <bits per second>")
+  console.log("  --camera <name> --channel <name> --fps <frames per second>")
   process.exit(3)
 }
 
@@ -86,22 +99,57 @@ const channel = (camera.channels ?? []).find(c => c.name === wantChannel)
 
 if (!channel) { console.error(`\n✗ no channel named ${JSON.stringify(wantChannel)}`); process.exit(1) }
 
-const value = Number(target)
+const fpsValue = wantFps ? Number(wantFps) : null
 
-if (!Number.isFinite(value) || (value < channel.minBitrate) || (value > channel.maxBitrate)) {
+if (fpsValue !== null) {
+  const offered = channel.fpsValues ?? []
+
+  if (!offered.includes(fpsValue)) {
+    console.error(`\nx ${wantFps} fps is not offered on this channel. Offered: ${offered.join(", ")}`)
+    process.exit(1)
+  }
+
+  if (![15, 24, 30].includes(fpsValue)) {
+    console.error(`\nx HomeKit negotiates 15, 24 or 30 fps only; ${fpsValue} cannot be advertised honestly.`)
+    process.exit(1)
+  }
+}
+
+const value = target ? Number(target) : null
+
+if ((value !== null) && (!Number.isFinite(value) || (value < channel.minBitrate) || (value > channel.maxBitrate))) {
   console.error(`\n✗ ${target} is outside this channel'"'"'s allowed range ` +
     `${channel.minBitrate}..${channel.maxBitrate}`)
   process.exit(1)
 }
 
-console.log(`\nChange: ${camera.name} / ${channel.name}   ${rate(channel.bitrate)} -> ${rate(value)}`)
+const changes = []
+
+if (value !== null) { changes.push(`bitrate ${rate(channel.bitrate)} -> ${rate(value)}`) }
+if (fpsValue !== null) { changes.push(`fps ${channel.fps} -> ${fpsValue}`) }
+
+console.log(`\nChange: ${camera.name} / ${channel.name}   ${changes.join(",  ")}`)
+
+if ((fpsValue !== null) && channel.autoFps) { console.log("  also clearing autoFps, which would otherwise override it") }
+if ((value !== null) && channel.autoBitrate) { console.log("  also clearing autoBitrate, which would otherwise override it") }
 console.log("This writes to your Protect controller and affects every consumer of that channel.")
 
 fs.writeFileSync(planPath, JSON.stringify({
-  body: { channels: camera.channels.map(c => (c.id === channel.id) ? { ...c, bitrate: value } : c) },
+  body: { channels: camera.channels.map(c => {
+    if (c.id !== channel.id) { return c }
+
+    const next = { ...c }
+
+    // Protect re-derives an automatic setting and would undo an explicit one, so the
+    // matching flag is cleared whenever a value is set by hand.
+    if (value !== null) { next.bitrate = value; next.autoBitrate = false }
+    if (fpsValue !== null) { next.fps = fpsValue; next.autoFps = false }
+
+    return next
+  }) },
   cameraId: camera.id,
 }))
-' "$BOOT" "$PLAN" "$CAMERA" "$CHANNEL" "$TARGET" && APPLY=1 || APPLY=0
+' "$BOOT" "$PLAN" "$CAMERA" "$CHANNEL" "$TARGET" "$FPS" && APPLY=1 || APPLY=0
 
 [ "$APPLY" = "1" ] || exit 0
 
