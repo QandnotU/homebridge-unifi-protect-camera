@@ -94,7 +94,12 @@ export class FfmpegDelivery {
     const args = FfmpegDelivery.arguments(options)
 
     options.log.info('Delivering through FFmpeg: %s', binary)
-    options.log.debug('FFmpeg arguments: %s', args.join(' '))
+    // The SRTP master key and salt travel in the arguments. They are per-session and
+    // short-lived, but logging key material writes it to disk, so it is redacted — the rest
+    // of the command line is what is worth being able to read back.
+    options.log.debug('FFmpeg arguments: %s', args
+      .map((argument, index) => ((args[index - 1] === '-srtp_out_params') ? '<redacted>' : argument))
+      .join(' '))
 
     const child = spawn(binary, args, { stdio: ['pipe', 'pipe', 'pipe'] })
 

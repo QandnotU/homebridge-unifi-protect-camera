@@ -476,6 +476,7 @@ export class ProtectStreamingDelegate implements CameraStreamingDelegate {
 
     let lastTimestamp = 0
     let dump: WriteStream | null = null
+    const rawDump: WriteStream | null = DUMP_DIR ? createWriteStream(join(DUMP_DIR, `${sessionId}.mp4`)) : null
 
     if (DUMP_DIR) {
       dump = createWriteStream(join(DUMP_DIR, `${sessionId}.h264`))
@@ -524,6 +525,7 @@ export class ProtectStreamingDelegate implements CameraStreamingDelegate {
             fps: tier?.fps ?? 30,
             log: this.#log,
             signal: generation.signal,
+            ...(rawDump ? { rawSink: (chunk: Buffer) => { rawDump.write(chunk) } } : {}),
           })
 
           if (first) {
@@ -687,6 +689,12 @@ export class ProtectStreamingDelegate implements CameraStreamingDelegate {
     }
 
     this.#sessions.delete(sessionId)
+
+    if (USE_FFMPEG) {
+      // Every figure in the summary describes our own sender, which sent nothing this
+      // session. Printing it would describe a path that was not used.
+      return
+    }
 
     const stats = session.videoSender.stats
 

@@ -67,6 +67,14 @@ export interface VideoSourceOptions {
   readonly channelId: number
   readonly log: ScopedLogger
   readonly signal: AbortSignal
+  /**
+   * Receives the untouched fMP4: the initialisation segment, then every media fragment.
+   *
+   * The result is a playable file carrying exactly what the controller sent, which lets our
+   * demuxing be compared against a reference decoder's on byte-identical input. Our own
+   * Annex-B dump cannot do that — it shows what we produced, not what we were given.
+   */
+  readonly rawSink?: (chunk: Buffer) => void
   /** Nominal frame rate, used only to synthesise timing if the controller sends none. */
   readonly fps: number
 }
@@ -88,6 +96,7 @@ export class VideoSource {
   readonly #log: ScopedLogger
   readonly #fps: number
   readonly #videoTrackId: number | null
+  readonly #rawSink: ((chunk: Buffer) => void) | null
 
   #mismatches = 0
   #sawComposition = false
@@ -111,6 +120,7 @@ export class VideoSource {
     log: ScopedLogger,
     fps: number,
     videoTrackId: number | null,
+    rawSink: ((chunk: Buffer) => void) | null,
   ) {
     this.#config = config
     this.#track = track
@@ -118,6 +128,7 @@ export class VideoSource {
     this.#log = log
     this.#fps = fps
     this.#videoTrackId = videoTrackId
+    this.#rawSink = rawSink
   }
 
   /**
@@ -147,6 +158,8 @@ export class VideoSource {
       throw new Error('Protect established the livestream but sent no initialisation segment')
     }
 
+    options.rawSink?.(init.data)
+
     if (init.codec && !init.codec.toLowerCase().includes('avc')) {
       throw new Error(`stream is ${init.codec}, but the classic HomeKit path carries H.264 only`)
     }
@@ -173,7 +186,7 @@ export class VideoSource {
       options.log.warn('Could not identify the video track; audio may be misread as video.')
     }
 
-    return new VideoSource(config, track, subscription, options.log, options.fps, videoTrackId)
+    return new VideoSource(config, track, subscription, options.log, options.fps, videoTrackId, options.rawSink ?? null)
   }
 
   get config(): AvcConfig {
@@ -258,6 +271,8 @@ export class VideoSource {
       if ((segment.type !== 'media') || !segment.mdat) {
         continue
       }
+
+      this.#rawSink?.(segment.data ?? Buffer.alloc(0))
 
       const track = videoTrack(segment, this.#videoTrackId)
 
