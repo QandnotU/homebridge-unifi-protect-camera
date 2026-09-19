@@ -1149,3 +1149,86 @@ brief hold followed by a catch-up).
 **mp-consulting/homebridge-unifi-protect** — [repo](https://github.com/mp-consulting/homebridge-unifi-protect), commit history through 2026-09-10 (snapshot deadline bounding, zero-dependency migration, optional FFmpeg)
 
 **Matter** — `homebridge/src/matter/types.ts` (curated `deviceTypes` map, `MatterAccessory.deviceType: EndpointType` at :204), `homebridge/src/api.ts:236` (`MatterAPI`); `@matter/types@0.17.9` and `@matter/node@0.17.9` (camera/snapshot-camera/floodlight-camera/video-doorbell device types; CameraAvStreamManagement, WebRtcTransportProvider/Requestor, PushAvStreamTransport, ZoneManagement clusters). On Apple's non-support of Matter cameras: [MacObserver, "4K HomeKit Secure Video in iOS 27"](https://www.macobserver.com/tips/round-ups/4k-homekit-secure-video-ios-27-what-apple-confirmed/), [HomeKit News, June 2026](https://homekitnews.com/2026/06/09/apple-intelligence-and-4k-recording-come-to-the-home-app/)
+
+## 10. The live video investigation (2026-09-18)
+
+Phase 2 produced a stream HomeKit would play but not one anybody would want to watch:
+the picture broke up on movement and stalled intermittently. Four defects were behind
+it. Three were found by measurement; the fourth was found only by comparing against a
+sender known to work, after eight theories had been proposed and killed.
+
+Recorded here because the *method* generalises and the dead ends were expensive.
+
+### 10.1 What was actually wrong
+
+| Defect | Mechanism | Fix |
+| --- | --- | --- |
+| Oversized datagrams | The negotiated MTU describes the IP datagram; we spent it on the RTP header and auth tag alone, so a 1378 MTU produced 1406-byte datagrams | `maxPayloadSize` subtracts IP+UDP (`88918ef`) |
+| Clock drift | The RTP clock was rebuilt from per-segment spacing, re-estimating the frame interval every fragment; it ran 0.92% slow and accumulated without bound (−463 ms over 289 segments) | Anchor each fragment to `tfdt` (`4732438`) |
+| Pauses | Protect delivers ~3 pictures per 100 ms fragment and we forwarded them on arrival: a burst, then idle. Send skew 46.5 ms mean against a 33 ms frame interval | Pace on the media clock (`d6ef91d`) |
+| Residual artifacting | Fewer per-frame timestamps arrive than the fragment holds pictures in **98%** of fragments, so spacing was synthesised uniformly. Real intervals vary (2999, 3049, 2951, 3000). The error accumulates until it overshoots the next fragment's anchor and **the clock steps backwards** | Space by the `trun`'s own durations (`dc01460`) |
+
+Measured end to end: interarrival jitter 704 ms → 16 ms, send skew 46.5 ms → 1.1 ms,
+packet loss zero throughout, backward timestamp steps 6 → 0.
+
+### 10.2 The eight theories that were wrong
+
+Each was plausible, each was killed by measurement, and each cost a test cycle:
+B-frames (no composition offsets present) · channel bitrate (capping it made the
+picture worse — encoder starvation) · burst overrun (receiver reports put loss at
+exactly zero) · Wi-Fi (a wired client was identical) · multi-slice (32,487 pictures,
+every one single-slice) · send timing (driven to 1.1 ms skew, symptom unchanged) ·
+bandwidth (pinned to a channel inside HomeKit's negotiated budget, symptom unchanged) ·
+microbursts (FFmpeg bursts an 81-packet keyframe in 2.9 ms; we do it in 1.8 ms).
+
+### 10.3 What finally worked
+
+Delivering the same stream through FFmpeg's RTP muxer (`-codec:v copy`, so a
+byte-identical bitstream) produced a clean picture where ours did not. That reduced an
+open-ended question to a diff between two senders on identical input.
+
+SRTP encrypts the payload and leaves the RTP header in the clear, so `tcpdump` on both
+paths gives sequence numbers, timestamps and marker bits without any key. Everything
+matched — packets per picture (2.25 vs 2.08), intra-picture gap (0.119 vs 0.122 ms),
+packet sizes, marker placement, sequence continuity — except one column:
+
+```
+ours   : 6 backward timestamp steps in 29 s   (−33 to −67 ticks)
+ffmpeg : 0
+```
+
+Under a millisecond each, but a backward RTP timestamp is a discontinuity to a
+receiver, and at one per ~5 s against a ~3 s keyframe interval the picture is broken
+much of the time.
+
+### 10.4 Lessons that cost the most
+
+**A diagnostic that lies is worse than none.** Three shipped this session and each was
+briefly believed: a send-skew metric wrecked by 32-bit RTP timestamp wraparound
+(reporting a 13-hour mean), a session summary naming the channel the *selector* chose
+rather than the one streamed, and a summary of our own sender printed for sessions
+FFmpeg delivered. All three were caught only by noticing an internal contradiction.
+
+**Two harness results were announced as conclusions and were artifacts.** A slice-count
+"mismatch" (FFmpeg dropped keyframes from a synthetic capture file — our demux was
+exact, matching the `trun`'s own byte accounting to 833×4 bytes of length prefix) and
+the microburst theory. Both looked decisive.
+
+**The container knew the answer the whole time.** `tfdt` for the timeline and `trun`
+durations for the spacing were present in every fragment from the first session. Two of
+the four defects came from inferring what the format already stated.
+
+**Verify the build under test.** Node reads `dist` once at startup, so an instance left
+running through a rebuild silently serves old code. This cost three cycles and one
+false positive before the dev script printed the build it loaded.
+
+### 10.5 Where this leaves the project
+
+The live path now works on its own RTP stack, passthrough, no FFmpeg. But the reason
+this plugin exists — OS 27 / HKSV3 / resolutions above 1080p — remains blocked upstream
+for *everyone* by HAP-NodeJS (§3, Q5). Until [#1132](https://github.com/homebridge/HAP-NodeJS/pull/1132)
+lands, the mature incumbent ([hjdhjd/homebridge-unifi-protect](https://github.com/hjdhjd/homebridge-unifi-protect))
+is the better choice for daily use: it already does passthrough (`-codec:v copy`), and
+adds HKSV, a timeshift buffer, doorbells, chimes and liveviews.
+
+This remains the research track, and it is now positioned for the moment #1132 lands.
